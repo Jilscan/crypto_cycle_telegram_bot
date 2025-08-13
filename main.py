@@ -17,6 +17,20 @@ from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, ContextTypes,
 )
 
+# --- tiny health-check server for Koyeb web deploys ---
+PORT = int(os.getenv("PORT", "0"))  # Koyeb sets PORT for web services
+if PORT:
+    from aiohttp import web
+
+    async def ping(request):
+        return web.Response(text="ok")
+    health_app = web.Application()
+    health_app.add_routes([web.get("/", ping), web.get("/health", ping)])
+    # Run the server in the backgroun
+    asyncio.get_event_loop().create_task(
+        web._run_app(health_app, host="0.0.0.0", port=PORT))
+# -------------------------------------------------------
+
 # -----------------------------
 # Config / Models
 # -----------------------------
@@ -481,21 +495,6 @@ async def push_alerts(app: Application):
 def parse_hhmm(hhmm: str) -> Tuple[int, int]:
     hh, mm = hhmm.split(":")
     return int(hh), int(mm)
-
-
-  # --- tiny health-check server for Koyeb web deploys ---
-PORT = int(os.getenv("PORT", "0"))  # Koyeb sets PORT for web services
-if PORT:
-    from aiohttp import web
-
-    async def ping(request):
-        return web.Response(text="ok")
-    health_app = web.Application()
-    health_app.add_routes([web.get("/", ping), web.get("/health", ping)])
-    # Run the server in the background
-    asyncio.get_event_loop().create_task(
-        web._run_app(health_app, host="0.0.0.0", port=PORT))
-# -------------------------------------------------------
 
 
 async def main():
