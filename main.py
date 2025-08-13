@@ -26,7 +26,7 @@ if PORT:
         return web.Response(text="ok")
     health_app = web.Application()
     health_app.add_routes([web.get("/", ping), web.get("/health", ping)])
-    # Run the server in the backgroun
+    # Run the server in the background
     asyncio.get_event_loop().create_task(
         web._run_app(health_app, host="0.0.0.0", port=PORT))
 # -------------------------------------------------------
@@ -514,8 +514,8 @@ async def main():
     load_profiles()
 
     # Scheduler
-    scheduler = AsyncIOScheduler(timezone=str(
-        datetime.now().astimezone().tzinfo))
+    tzname = os.getenv("TZ", "UTC")
+    scheduler = AsyncIOScheduler(timezone=tzname)
     # Daily summary
     hh, mm = parse_hhmm(CFG.schedule.get("daily_summary_time", "13:00"))
     scheduler.add_job(lambda: asyncio.create_task(push_summary(app)),
