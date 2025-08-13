@@ -1,0 +1,64 @@
+telegram:
+  token: YOUR_TELEGRAM_BOT_TOKEN
+schedule:
+  daily_summary_time: '13:00'
+symbols:
+  funding:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - DOGEUSDT
+  oi:
+  - BTCUSDT
+  - ETHUSDT
+thresholds:
+  min_flags_for_alert: 3
+  btc_dominance_max: 60.0
+  eth_btc_ratio_max: 0.09
+  altcap_btc_ratio_max: 1.8
+  funding_rate_abs_max: 0.1
+  open_interest_btc_usdt_usd_max: 20000000000
+  open_interest_eth_usdt_usd_max: 8000000000
+  google_trends_7d_avg_min: 75
+glassnode:
+  api_key: ''
+  enable: false
+force_chat_id: ''
+logging:
+  level: INFO
+default_profile: moderate
+risk_profiles:
+  conservative:
+    thresholds:
+      min_flags_for_alert: 2
+      btc_dominance_max: 57.0
+      eth_btc_ratio_max: 0.085
+      altcap_btc_ratio_max: 1.6
+      funding_rate_abs_max: 0.06
+      open_interest_btc_usdt_usd_max: 15000000000
+      open_interest_eth_usdt_usd_max: 6000000000
+      google_trends_7d_avg_min: 60
+      mvrv_z_extreme: 6.5
+  moderate:
+    thresholds:
+      min_flags_for_alert: 3
+      btc_dominance_max: 60.0
+      eth_btc_ratio_max: 0.09
+      altcap_btc_ratio_max: 1.8
+      funding_rate_abs_max: 0.1
+      open_interest_btc_usdt_usd_max: 20000000000
+      open_interest_eth_usdt_usd_max: 8000000000
+      google_trends_7d_avg_min: 75
+      mvrv_z_extreme: 7.0
+  aggressive:
+    thresholds:
+      min_flags_for_alert: 4
+      btc_dominance_max: 62.0
+      eth_btc_ratio_max: 0.095
+      altcap_btc_ratio_max: 2.0
+      funding_rate_abs_max: 0.14
+      open_interest_btc_usdt_usd_max: 25000000000
+      open_interest_eth_usdt_usd_max: 10000000000
+      google_trends_7d_avg_min: 85
+      mvrv_z_extreme: 8.0
