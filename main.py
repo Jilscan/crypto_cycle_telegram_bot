@@ -283,4 +283,266 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
     altcap_btc_ratio = (altcap / btc_mcap) if btc_mcap > 0 else 0.0
 
     # trends + optional on-chain
-    trends_avg, trends_by_kw = await dc.google_tr
+    trends_avg, trends_by_kw = await dc.google_trends_score(["crypto", "bitcoin", "ethereum"])
+    mvrv_z = await dc.glassnode_mvrv_z("BTC")
+    exch_inflow = await dc.glassnode_exchange_inflow("BTC")
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "btc_dominance_pct": btc_pct,
+        "eth_btc": ethbtc,
+        "altcap_btc_ratio": altcap_btc_ratio,
+        "funding": funding,
+        "open_interest_usd": oi_usd,
+        "google_trends_avg7d": trends_avg,
+        "google_trends_breakdown": trends_by_kw,
+        "mvrv_z": mvrv_z,
+        "exchange_inflow_proxy": exch_inflow,
+    }
+
+
+def build_status_text(m: Dict[str, Any]) -> str:
+    lines = [
+        f"📊 *Crypto Cycle Snapshot* (`{m['timestamp']}` UTC)",
+        f"• BTC Dominance: *{m['btc_dominance_pct']:.2f}%*",
+        f"• ETH/BTC: *{m['eth_btc']:.5f}*",
+        f"• Altcap/BTC: *{m['altcap_btc_ratio']:.2f}*",
+        "• Funding (8h, est):",
+    ]
+    for sym, d in m["funding"].items():
+        fr_pct = float(d.get("lastFundingRate", 0.0)) * 100.0
+        lines.append(f"   - {sym}: *{fr_pct:.3f}%*")
+    lines.append("• Open Interest (USD est):")
+    for sym, notional in m["open_interest_usd"].items():
+        lines.append(
+            f"   - {sym}: *${notional:,.0f}*" if notional is not None else f"   - {sym}: n/a")
+    lines.append(
+        f"• Google Trends 7d avg: *{m['google_trends_avg7d']:.1f}* "
+        f"(crypto {m['google_trends_breakdown']['crypto']:.1f}, "
+        f"bitcoin {m['google_trends_breakdown']['bitcoin']:.1f}, "
+        f"ethereum {m['google_trends_breakdown']['ethereum']:.1f})"
+    )
+    if m.get("mvrv_z") is not None:
+        lines.append(f"• BTC MVRV Z-Score (Glassnode): *{m['mvrv_z']:.2f}*")
+    if m.get("exchange_inflow_proxy") is not None:
+        lines.append(
+            f"• Exchange inflow proxy (Glassnode, adj sum): *{m['exchange_inflow_proxy']:.2f}*")
+    return "\n".join(lines)
+
+
+def evaluate_flags(m: Dict[str, Any], t: Dict[str, Any]) -> Tuple[int, List[str]]:
+    flags: List[str] = []
+    if m["btc_dominance_pct"] >= t["btc_dominance_max"]:
+        flags.append("BTC dominance high")
+    if m["eth_btc"] >= t["eth_btc_ratio_max"]:
+        flags.append("ETH/BTC elevated")
+    if m["altcap_btc_ratio"] >= t["altcap_btc_ratio_max"]:
+        flags.append("Altcap/BTC stretched")
+    for sym, d in m["funding"].items():
+        fr_pct = abs(float(d.get("lastFundingRate", 0.0)) * 100.0)
+        if fr_pct >= t["funding_rate_abs_max"]:
+            flags.append(f"Funding extreme: {sym} ({fr_pct:.3f}%)")
+            break
+    oi = m["open_interest_usd"]
+    if oi.get("BTCUSDT") and oi["BTCUSDT"] >= t["open_interest_btc_usdt_usd_max"]:
+        flags.append(f"BTC OI high (${oi['BTCUSDT']:,.0f})")
+    if oi.get("ETHUSDT") and oi["ETHUSDT"] >= t["open_interest_eth_usdt_usd_max"]:
+        flags.append(f"ETH OI high (${oi['ETHUSDT']:,.0f})")
+    if m["google_trends_avg7d"] >= t["google_trends_7d_avg_min"]:
+        flags.append("Retail interest (Google) high")
+    if m.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None and m["mvrv_z"] >= t["mvrv_z_extreme"]:
+        flags.append("MVRV Z-Score extreme")
+    return len(flags), flags
+
+# ───────────────────────────
+# Telegram bot commands
+# ───────────────────────────
+
+
+SUBSCRIBERS: set[int] = set()
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    SUBSCRIBERS.add(update.effective_chat.id)
+    await update.message.reply_text(
+        "👋 Crypto Cycle Watch online.\n"
+        "Commands: /status, /subscribe, /unsubscribe, /risk <conservative|moderate|aggressive>, "
+        "/getrisk, /settime HH:MM."
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    dc = DataClient()
+    try:
+        m = await gather_metrics(dc)
+        text = build_status_text(m)
+        if CFG.risk_profiles:
+            cur = CHAT_PROFILE.get(
+                update.effective_chat.id, CFG.default_profile)
+            text += f"\n• Risk profile: *{cur}*"
+        t = get_thresholds_for_chat(update.effective_chat.id)
+        n, flags = evaluate_flags(m, t)
+        if n > 0:
+            text += "\n\n⚠️ Flags: " + ", ".join(flags)
+        await update.message.reply_markdown(text)
+    finally:
+        await dc.close()
+
+
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    SUBSCRIBERS.add(update.effective_chat.id)
+    await update.message.reply_text("✅ Subscribed. You'll receive alerts and daily summaries here.")
+
+
+async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    SUBSCRIBERS.discard(update.effective_chat.id)
+    await update.message.reply_text("🛑 Unsubscribed.")
+
+
+async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args[0]) != 5 or context.args[0][2] != ":":
+        await update.message.reply_text("Usage: /settime HH:MM (24h)")
+        return
+    CFG.schedule["daily_summary_time"] = context.args[0]
+    await update.message.reply_text(f"🕒 Daily summary time set to {context.args[0]} (server time).")
+
+
+async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not CFG.risk_profiles:
+        await update.message.reply_text("Risk profiles not configured; using static thresholds.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /risk <conservative|moderate|aggressive>")
+        return
+    choice = context.args[0].lower()
+    if choice not in CFG.risk_profiles:
+        await update.message.reply_text(f"Unknown profile '{choice}'. Options: {', '.join(CFG.risk_profiles.keys())}")
+        return
+    CHAT_PROFILE[update.effective_chat.id] = choice
+    save_profiles()
+    await update.message.reply_text(f"✅ Risk profile set to *{choice}*.", parse_mode="Markdown")
+
+
+async def cmd_getrisk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = CHAT_PROFILE.get(update.effective_chat.id, CFG.default_profile)
+    await update.message.reply_text(f"Current risk profile: *{cur}*", parse_mode="Markdown")
+
+
+async def push_summary(app: Application):
+    dc = DataClient()
+    try:
+        m = await gather_metrics(dc)
+        text = build_status_text(m)
+        t = get_thresholds_for_chat(None)
+        n, flags = evaluate_flags(m, t)
+        if n > 0:
+            text += "\n\n⚠️ Flags: " + ", ".join(flags)
+        for chat_id in set(SUBSCRIBERS):
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            except Exception as e:
+                log.warning("Failed to send summary to %s: %s", chat_id, e)
+    finally:
+        await dc.close()
+
+
+async def push_alerts(app: Application):
+    dc = DataClient()
+    try:
+        m = await gather_metrics(dc)
+        t = get_thresholds_for_chat(None)
+        n, flags = evaluate_flags(m, t)
+        if n >= t.get("min_flags_for_alert", 3):
+            text = "🚨 *Top Risk Alert*\n" + \
+                build_status_text(m) + "\n\n⚠️ Flags: " + ", ".join(flags)
+            for chat_id in set(SUBSCRIBERS):
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                except Exception as e:
+                    log.warning("Failed to send alert to %s: %s", chat_id, e)
+    finally:
+        await dc.close()
+
+
+def parse_hhmm(hhmm: str) -> Tuple[int, int]:
+    hh, mm = hhmm.split(":")
+    return int(hh), int(mm)
+
+# ───────────────────────────
+# Health server (Koyeb web)
+# ───────────────────────────
+
+
+async def start_health_server():
+    from aiohttp import web
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    async def ping(request): return web.Response(text="ok")
+    app.add_routes([web.get("/", ping), web.get("/health", ping)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Health server listening on :{port}")
+
+# ───────────────────────────
+# Main
+# ───────────────────────────
+
+
+async def main():
+    token = os.getenv("TELEGRAM_TOKEN") or CFG.telegram.get("token", "")
+    if not token:
+        log.error(
+            "No TELEGRAM_TOKEN set and no token in config.yml. Set TELEGRAM_TOKEN env.")
+        raise SystemExit(1)
+
+    app: Application = ApplicationBuilder().token(token).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
+    app.add_handler(CommandHandler("settime", cmd_settime))
+    app.add_handler(CommandHandler("risk", cmd_risk))
+    app.add_handler(CommandHandler("getrisk", cmd_getrisk))
+
+    load_profiles()
+
+    # Start health server first so health checks pass
+    await start_health_server()
+
+    # Scheduler bound to current loop
+    tzname = os.getenv("TZ", "UTC")
+    loop = asyncio.get_running_loop()
+    scheduler = AsyncIOScheduler(timezone=tzname, event_loop=loop)
+
+    hh, mm = parse_hhmm(CFG.schedule.get("daily_summary_time", "13:00"))
+    scheduler.add_job(push_summary, CronTrigger(
+        hour=hh, minute=mm), args=[app])
+    scheduler.add_job(push_alerts, CronTrigger(minute="*/15"), args=[app])
+    scheduler.start()
+
+    if CFG.force_chat_id:
+        try:
+            await app.bot.send_message(chat_id=int(CFG.force_chat_id), text="🤖 Crypto Cycle Watch bot started.")
+        except Exception as e:
+            log.warning("Unable to notify force_chat_id: %s", e)
+
+    log.info("Bot running. Press Ctrl+C to exit.")
+
+    await app.initialize()
+    await app.start()
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await app.stop()
+        await app.shutdown()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
