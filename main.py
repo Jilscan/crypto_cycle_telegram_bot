@@ -534,10 +534,18 @@ async def main():
 
     await app.initialize()
     await app.start()
+
+    # Start fetching updates from Telegram (long polling)
+    await app.updater.start_polling(drop_pending_updates=True)   # <<< NEW
+    # (Upgrader.start_polling is the official way to begin polling without run_polling)
+    # Docs: Updater.start_polling(...)  :contentReference[oaicite:1]{index=1}
+
     try:
         while True:
             await asyncio.sleep(3600)
     finally:
+        # Stop polling first, then stop the application
+        await app.updater.stop()          # <<< NEW
         await app.stop()
         await app.shutdown()
 
