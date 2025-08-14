@@ -609,12 +609,12 @@ SUBSCRIBERS: set[int] = set()
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUBSCRIBERS.add(update.effective_chat.id)
-    await update.message.reply_text(
+    msg = (
         "👋 Crypto Cycle Watch online.\n"
         "Commands: /status, /assess, /assess_json, /subscribe, /unsubscribe, "
-        "/risk <conservative|moderate|aggressive>, /getrisk, /settime HH:MM.",
-        parse_mode="HTML"
+        "/risk &lt;conservative|moderate|aggressive&gt;, /getrisk, /settime HH:MM."
     )
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -655,7 +655,7 @@ async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Risk profiles not configured; using static thresholds.", parse_mode="HTML")
         return
     if not context.args:
-        await update.message.reply_text("Usage: /risk <conservative|moderate|aggressive>", parse_mode="HTML")
+        await update.message.reply_text("Usage: /risk &lt;conservative|moderate|aggressive&gt;", parse_mode="HTML")
         return
     choice = context.args[0].lower()
     if choice not in CFG.risk_profiles:
@@ -759,6 +759,7 @@ async def cmd_assess_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bio.seek(0)
             await update.message.reply_document(document=bio, caption=f"JSON dump{webhook_status}")
         else:
+            # No parse_mode for JSON text to avoid HTML escaping issues
             await update.message.reply_text(text + (f"\n\n{webhook_status}" if webhook_status else ""))
     finally:
         await dc.close()
