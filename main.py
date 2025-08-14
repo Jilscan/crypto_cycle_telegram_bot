@@ -18,7 +18,7 @@ from telegram.ext import Application, ApplicationBuilder, CommandHandler, Contex
 # ───────────────────────────
 
 DEFAULTS: Dict[str, Any] = {
-    "telegram": {"token": ""},  # we prefer TELEGRAM_TOKEN env on Koyeb
+    "telegram": {"token": ""},  # prefer TELEGRAM_TOKEN env on Koyeb
     "schedule": {"daily_summary_time": "13:00"},
     "symbols": {
         "funding": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"],
@@ -247,23 +247,28 @@ class DataClient:
         return None
 
 # ───────────────────────────
-# Metrics
+# Metrics (resilient)
 # ───────────────────────────
 
 
 async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
-    # structure via CoinGecko
-    cg = await dc.coingecko_global()
-    ethbtc = await dc.coingecko_eth_btc()
+    # Safe fetches (defaults on failure)
+    cg = await _safe(
+        dc.coingecko_global(),
+        {"data": {"total_market_cap": {"usd": 0.0},
+                  "market_cap_percentage": {"btc": 0.0, "eth": 0.0}}},
+        "coingecko_global"
+    )
+    ethbtc = await _safe(dc.coingecko_eth_btc(), 0.0, "coingecko_eth_btc")
 
-    # funding + last price from Bybit
+    # funding + last price (Bybit)
     funding: Dict[str, Dict[str, Any]] = {}
     for sym in CFG.symbols["funding"]:
         fr = await _safe(dc.bybit_funding_rate(sym), 0.0, f"funding {sym}")
         lp = await _safe(dc.bybit_ticker_last_price(sym), 0.0, f"lastPrice {sym}")
         funding[sym] = {"lastFundingRate": fr or 0.0, "markPrice": lp or 0.0}
 
-    # open interest (contracts) -> approx USD via lastPrice
+    # open interest ~ USD estimate
     oi_usd: Dict[str, Optional[float]] = {}
     for sym in CFG.symbols["oi"]:
         oi_contracts = await _safe(dc.bybit_open_interest(sym), None, f"openInterest {sym}")
@@ -274,18 +279,25 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
             oi_usd[sym] = None
 
     # market-cap layout
-    total_mcap = cg["data"]["total_market_cap"].get("usd", 0.0)
-    btc_pct = cg["data"]["market_cap_percentage"].get("btc", 0.0)
-    eth_pct = cg["data"]["market_cap_percentage"].get("eth", 0.0)
-    btc_mcap = total_mcap * (btc_pct / 100.0)
-    eth_mcap = total_mcap * (eth_pct / 100.0)
+    total_mcap = float(((cg or {}).get("data", {}).get(
+        "total_market_cap", {}).get("usd", 0.0)))
+    btc_pct = float(((cg or {}).get("data", {}).get(
+        "market_cap_percentage", {}).get("btc", 0.0)))
+    eth_pct = float(((cg or {}).get("data", {}).get(
+        "market_cap_percentage", {}).get("eth", 0.0)))
+    btc_mcap = total_mcap * (btc_pct / 100.0) if total_mcap else 0.0
+    eth_mcap = total_mcap * (eth_pct / 100.0) if total_mcap else 0.0
     altcap = max(total_mcap - btc_mcap - eth_mcap, 0.0)
     altcap_btc_ratio = (altcap / btc_mcap) if btc_mcap > 0 else 0.0
 
-    # trends + optional on-chain
-    trends_avg, trends_by_kw = await dc.google_trends_score(["crypto", "bitcoin", "ethereum"])
-    mvrv_z = await dc.glassnode_mvrv_z("BTC")
-    exch_inflow = await dc.glassnode_exchange_inflow("BTC")
+    # Google Trends + optional on-chain
+    trends_avg, trends_by_kw = await _safe(
+        dc.google_trends_score(["crypto", "bitcoin", "ethereum"]),
+        (0.0, {"crypto": 0.0, "bitcoin": 0.0, "ethereum": 0.0}),
+        "google_trends_score"
+    )
+    mvrv_z = await _safe(dc.glassnode_mvrv_z("BTC"), None, "glassnode_mvrv_z")
+    exch_inflow = await _safe(dc.glassnode_exchange_inflow("BTC"), None, "glassnode_exchange_inflow")
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -294,8 +306,8 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
         "altcap_btc_ratio": altcap_btc_ratio,
         "funding": funding,
         "open_interest_usd": oi_usd,
-        "google_trends_avg7d": trends_avg,
-        "google_trends_breakdown": trends_by_kw,
+        "google_trends_avg7d": float(trends_avg or 0.0),
+        "google_trends_breakdown": trends_by_kw or {"crypto": 0.0, "bitcoin": 0.0, "ethereum": 0.0},
         "mvrv_z": mvrv_z,
         "exchange_inflow_proxy": exch_inflow,
     }
@@ -366,108 +378,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUBSCRIBERS.add(update.effective_chat.id)
     await update.message.reply_text(
         "👋 Crypto Cycle Watch online.\n"
-        "Commands: /status, /subscribe, /assess, /unsubscribe, /risk <conservative|moderate|aggressive>, "
-        "/getrisk, /settime HH:MM."
+        "Commands: /status, /assess, /assess_json, /subscribe, /unsubscribe, "
+        "/risk <conservative|moderate|aggressive>, /getrisk, /settime HH:MM."
     )
-
-
-async def cmd_assess(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show a full, per-metric assessment vs thresholds for this chat's profile."""
-    chat_id = update.effective_chat.id if update and update.effective_chat else None
-    dc = DataClient()
-    try:
-        m = await gather_metrics(dc)
-        # pick thresholds by chat/profile
-        t = get_thresholds_for_chat(chat_id)
-        profile = (
-            CHAT_PROFILE.get(chat_id, CFG.default_profile)
-            if CFG.risk_profiles else "static"
-        )
-
-        def flag_mark(is_flag: bool) -> str:
-            return "🚨" if is_flag else "✅"
-
-        lines = []
-        lines.append(f"🧪 *Current Assessment* (`{m['timestamp']}` UTC)")
-        lines.append(f"• Profile: *{profile}*")
-        lines.append("")
-
-        # BTC dominance
-        dom = float(m["btc_dominance_pct"])
-        f_dom = dom >= float(t["btc_dominance_max"])
-        lines.append(
-            f"{flag_mark(f_dom)} BTC dominance: *{dom:.2f}%*  (flag ≥ {t['btc_dominance_max']:.2f}%)"
-        )
-
-        # ETH/BTC
-        ethbtc = float(m["eth_btc"])
-        f_ethbtc = ethbtc >= float(t["eth_btc_ratio_max"])
-        lines.append(
-            f"{flag_mark(f_ethbtc)} ETH/BTC: *{ethbtc:.5f}*  (flag ≥ {t['eth_btc_ratio_max']:.5f})"
-        )
-
-        # Altcap/BTC
-        altbtc = float(m["altcap_btc_ratio"])
-        f_altbtc = altbtc >= float(t["altcap_btc_ratio_max"])
-        lines.append(
-            f"{flag_mark(f_altbtc)} Altcap/BTC: *{altbtc:.2f}*  (flag ≥ {t['altcap_btc_ratio_max']:.2f})"
-        )
-
-        # Funding extremes (max abs across configured symbols)
-        max_fr = None
-        max_sym = None
-        for sym, d in m["funding"].items():
-            fr_pct = abs(float(d.get("lastFundingRate", 0.0)) * 100.0)
-            if max_fr is None or fr_pct > max_fr:
-                max_fr, max_sym = fr_pct, sym
-        f_fund = (max_fr or 0.0) >= float(t["funding_rate_abs_max"])
-        lines.append(
-            f"{flag_mark(f_fund)} Funding (max |8h|): *{max_fr:.3f}%* on *{max_sym}*  (flag ≥ {t['funding_rate_abs_max']:.3f}%)"
-            if max_sym else
-            f"{flag_mark(False)} Funding: n/a"
-        )
-
-        # Open interest (USD est)
-        btc_oi = m["open_interest_usd"].get("BTCUSDT")
-        eth_oi = m["open_interest_usd"].get("ETHUSDT")
-        f_btc_oi = bool(btc_oi and btc_oi >= float(
-            t["open_interest_btc_usdt_usd_max"]))
-        f_eth_oi = bool(eth_oi and eth_oi >= float(
-            t["open_interest_eth_usdt_usd_max"]))
-        lines.append(
-            f"{flag_mark(f_btc_oi)} BTC OI est: *${(btc_oi or 0):,.0f}*  (flag ≥ ${t['open_interest_btc_usdt_usd_max']:,.0f})"
-        )
-        lines.append(
-            f"{flag_mark(f_eth_oi)} ETH OI est: *${(eth_oi or 0):,.0f}*  (flag ≥ ${t['open_interest_eth_usdt_usd_max']:,.0f})"
-        )
-
-        # Google Trends
-        gavg = float(m["google_trends_avg7d"])
-        f_trends = gavg >= float(t["google_trends_7d_avg_min"])
-        lines.append(
-            f"{flag_mark(f_trends)} Google Trends 7d avg: *{gavg:.1f}*  (flag ≥ {t['google_trends_7d_avg_min']:.1f})"
-        )
-
-        # Optional on-chain (MVRV Z)
-        if m.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None:
-            mz = float(m["mvrv_z"])
-            f_mz = mz >= float(t["mvrv_z_extreme"])
-            lines.append(
-                f"{flag_mark(f_mz)} BTC MVRV Z-Score: *{mz:.2f}*  (flag ≥ {t['mvrv_z_extreme']:.2f})"
-            )
-
-        # Final summary of flags using the existing helper
-        nflags, flags = evaluate_flags(m, t)
-        lines.append("")
-        if nflags > 0:
-            lines.append(
-                f"⚠️ *Triggered flags ({nflags}):* " + ", ".join(flags))
-        else:
-            lines.append("✅ *No flags* at current thresholds.")
-
-        await update.message.reply_markdown("\n".join(lines))
-    finally:
-        await dc.close()
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -527,6 +440,251 @@ async def cmd_getrisk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Current risk profile: *{cur}*", parse_mode="Markdown")
 
 
+async def cmd_assess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show a full, per-metric assessment vs thresholds for this chat's profile."""
+    chat_id = update.effective_chat.id if update and update.effective_chat else None
+    dc = DataClient()
+    try:
+        try:
+            m = await gather_metrics(dc)
+        except Exception as e:
+            await update.message.reply_text(
+                f"⚠️ Could not fetch metrics right now: {e}\nTry again in a minute."
+            )
+            return
+
+        t = get_thresholds_for_chat(chat_id)
+        profile = (CHAT_PROFILE.get(chat_id, CFG.default_profile)
+                   if CFG.risk_profiles else "static")
+
+        def flag_mark(is_flag: bool) -> str:
+            return "🚨" if is_flag else "✅"
+
+        lines = []
+        lines.append(
+            f"🧪 *Current Assessment* (`{m.get('timestamp','n/a')}` UTC)")
+        lines.append(f"• Profile: *{profile}*")
+        lines.append("")
+
+        dom = float(m.get("btc_dominance_pct") or 0.0)
+        f_dom = dom >= float(t["btc_dominance_max"])
+        lines.append(
+            f"{flag_mark(f_dom)} BTC dominance: *{dom:.2f}%*  (flag ≥ {t['btc_dominance_max']:.2f}%)")
+
+        ethbtc = float(m.get("eth_btc") or 0.0)
+        f_ethbtc = ethbtc >= float(t["eth_btc_ratio_max"])
+        lines.append(
+            f"{flag_mark(f_ethbtc)} ETH/BTC: *{ethbtc:.5f}*  (flag ≥ {t['eth_btc_ratio_max']:.5f})")
+
+        altbtc = float(m.get("altcap_btc_ratio") or 0.0)
+        f_altbtc = altbtc >= float(t["altcap_btc_ratio_max"])
+        lines.append(
+            f"{flag_mark(f_altbtc)} Altcap/BTC: *{altbtc:.2f}*  (flag ≥ {t['altcap_btc_ratio_max']:.2f})")
+
+        funding = m.get("funding") or {}
+        max_fr = None
+        max_sym = None
+        for sym, d in funding.items():
+            fr_pct = abs(float(d.get("lastFundingRate") or 0.0) * 100.0)
+            if max_fr is None or fr_pct > max_fr:
+                max_fr, max_sym = fr_pct, sym
+        f_fund = (max_fr or 0.0) >= float(t["funding_rate_abs_max"])
+        if max_sym:
+            lines.append(
+                f"{flag_mark(f_fund)} Funding (max |8h|): *{max_fr:.3f}%* on *{max_sym}*  (flag ≥ {t['funding_rate_abs_max']:.3f}%)")
+        else:
+            lines.append("✅ Funding: n/a")
+
+        oi = m.get("open_interest_usd") or {}
+        btc_oi = oi.get("BTCUSDT")
+        eth_oi = oi.get("ETHUSDT")
+        f_btc_oi = bool(btc_oi and btc_oi >= float(
+            t["open_interest_btc_usdt_usd_max"]))
+        f_eth_oi = bool(eth_oi and eth_oi >= float(
+            t["open_interest_eth_usdt_usd_max"]))
+        lines.append(
+            f"{flag_mark(f_btc_oi)} BTC OI est: *${(btc_oi or 0):,.0f}*  (flag ≥ ${t['open_interest_btc_usdt_usd_max']:,.0f})")
+        lines.append(
+            f"{flag_mark(f_eth_oi)} ETH OI est: *${(eth_oi or 0):,.0f}*  (flag ≥ ${t['open_interest_eth_usdt_usd_max']:,.0f})")
+
+        gavg = float(m.get("google_trends_avg7d") or 0.0)
+        f_trends = gavg >= float(t["google_trends_7d_avg_min"])
+        lines.append(
+            f"{flag_mark(f_trends)} Google Trends 7d avg: *{gavg:.1f}*  (flag ≥ {t['google_trends_7d_avg_min']:.1f})")
+
+        if m.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None:
+            mz = float(m.get("mvrv_z") or 0.0)
+            f_mz = mz >= float(t["mvrv_z_extreme"])
+            lines.append(
+                f"{flag_mark(f_mz)} BTC MVRV Z-Score: *{mz:.2f}*  (flag ≥ {t['mvrv_z_extreme']:.2f})")
+
+        try:
+            nflags, flags = evaluate_flags(m, t)
+        except Exception:
+            nflags, flags = 0, []
+        lines.append("")
+        if nflags > 0:
+            lines.append(
+                f"⚠️ *Triggered flags ({nflags}):* " + ", ".join(flags))
+        else:
+            lines.append("✅ *No flags* at current thresholds.")
+
+        await update.message.reply_markdown("\n".join(lines))
+    finally:
+        await dc.close()
+
+
+async def cmd_assess_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Return a full JSON dump of the current metrics, thresholds, and flags."""
+    chat_id = update.effective_chat.id if update and update.effective_chat else None
+    dc = DataClient()
+    try:
+        m = await gather_metrics(dc)
+        t = get_thresholds_for_chat(chat_id)
+        nflags, flags = evaluate_flags(m, t)
+        profile = (CHAT_PROFILE.get(chat_id, CFG.default_profile)
+                   if CFG.risk_profiles else "static")
+
+        payload = {
+            "timestamp": m["timestamp"],
+            "chat_id": chat_id,
+            "profile": profile,
+            "thresholds": t,
+            "metrics": m,
+            "flags_count": nflags,
+            "flags": flags,
+        }
+
+        # args: "file", "compact", "pretty"
+        as_file = False
+        pretty = True
+        if context.args:
+            for a in context.args:
+                a = a.lower()
+                if a == "file":
+                    as_file = True
+                elif a == "compact":
+                    pretty = False
+                elif a == "pretty":
+                    pretty = True
+
+        import json
+        import io
+        text = json.dumps(payload, indent=(
+            2 if pretty else None), ensure_ascii=False)
+
+        # Optional webhook
+        webhook_status = ""
+        webhook = os.getenv("JSON_WEBHOOK_URL")
+        if webhook:
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    r = await client.post(webhook, json=payload)
+                webhook_status = f" (webhook {r.status_code})"
+            except Exception as e:
+                webhook_status = f" (webhook error: {e})"
+
+        if as_file or len(text) > 3500:
+            bio = io.BytesIO(text.encode("utf-8"))
+            fname = f"assess_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
+            bio.name = fname
+            bio.seek(0)
+            await update.message.reply_document(document=bio, caption=f"JSON dump{webhook_status}")
+        else:
+            await update.message.reply_text(text + (f"\n\n{webhook_status}" if webhook_status else ""))
+    finally:
+        await dc.close()
+
+# ───────────────────────────
+# Health server (Koyeb web)
+# ───────────────────────────
+
+
+async def start_health_server():
+    from aiohttp import web
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    async def ping(request): return web.Response(text="ok")
+    app.add_routes([web.get("/", ping), web.get("/health", ping)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Health server listening on :{port}")
+
+
+def parse_hhmm(hhmm: str) -> Tuple[int, int]:
+    hh, mm = hhmm.split(":")
+    return int(hh), int(mm)
+
+# ───────────────────────────
+# Main
+# ───────────────────────────
+
+
+async def main():
+    token = os.getenv("TELEGRAM_TOKEN") or CFG.telegram.get("token", "")
+    if not token:
+        log.error(
+            "No TELEGRAM_TOKEN set and no token in config.yml. Set TELEGRAM_TOKEN env.")
+        raise SystemExit(1)
+
+    app: Application = ApplicationBuilder().token(token).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("assess", cmd_assess))
+    app.add_handler(CommandHandler("assess_json", cmd_assess_json))
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
+    app.add_handler(CommandHandler("settime", cmd_settime))
+    app.add_handler(CommandHandler("risk", cmd_risk))
+    app.add_handler(CommandHandler("getrisk", cmd_getrisk))
+
+    load_profiles()
+
+    # Start health server first so health checks pass
+    await start_health_server()
+
+    # Scheduler bound to current loop
+    tzname = os.getenv("TZ", "UTC")
+    loop = asyncio.get_running_loop()
+    scheduler = AsyncIOScheduler(timezone=tzname, event_loop=loop)
+
+    hh, mm = parse_hhmm(CFG.schedule.get("daily_summary_time", "13:00"))
+    scheduler.add_job(push_summary, CronTrigger(
+        hour=hh, minute=mm), args=[app])
+    scheduler.add_job(push_alerts, CronTrigger(minute="*/15"), args=[app])
+    scheduler.start()
+
+    if CFG.force_chat_id:
+        try:
+            await app.bot.send_message(chat_id=int(CFG.force_chat_id), text="🤖 Crypto Cycle Watch bot started.")
+        except Exception as e:
+            log.warning("Unable to notify force_chat_id: %s", e)
+
+    log.info("Bot running. Press Ctrl+C to exit.")
+
+    # Start PTB and begin polling for updates
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        # Stop polling first, then stop the application
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+# ───────────────────────────
+# Alerts / Summaries
+# ───────────────────────────
+
+
 async def push_summary(app: Application):
     dc = DataClient()
     try:
@@ -561,93 +719,6 @@ async def push_alerts(app: Application):
                     log.warning("Failed to send alert to %s: %s", chat_id, e)
     finally:
         await dc.close()
-
-
-def parse_hhmm(hhmm: str) -> Tuple[int, int]:
-    hh, mm = hhmm.split(":")
-    return int(hh), int(mm)
-
-# ───────────────────────────
-# Health server (Koyeb web)
-# ───────────────────────────
-
-
-async def start_health_server():
-    from aiohttp import web
-    port = int(os.getenv("PORT", "8080"))
-    app = web.Application()
-    async def ping(request): return web.Response(text="ok")
-    app.add_routes([web.get("/", ping), web.get("/health", ping)])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info(f"Health server listening on :{port}")
-
-# ───────────────────────────
-# Main
-# ───────────────────────────
-
-
-async def main():
-    token = os.getenv("TELEGRAM_TOKEN") or CFG.telegram.get("token", "")
-    if not token:
-        log.error(
-            "No TELEGRAM_TOKEN set and no token in config.yml. Set TELEGRAM_TOKEN env.")
-        raise SystemExit(1)
-
-    app: Application = ApplicationBuilder().token(token).build()
-
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
-    app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
-    app.add_handler(CommandHandler("settime", cmd_settime))
-    app.add_handler(CommandHandler("risk", cmd_risk))
-    app.add_handler(CommandHandler("getrisk", cmd_getrisk))
-    app.add_handler(CommandHandler("assess", cmd_assess))
-
-    load_profiles()
-
-    # Start health server first so health checks pass
-    await start_health_server()
-
-    # Scheduler bound to current loop
-    tzname = os.getenv("TZ", "UTC")
-    loop = asyncio.get_running_loop()
-    scheduler = AsyncIOScheduler(timezone=tzname, event_loop=loop)
-
-    hh, mm = parse_hhmm(CFG.schedule.get("daily_summary_time", "13:00"))
-    scheduler.add_job(push_summary, CronTrigger(
-        hour=hh, minute=mm), args=[app])
-    scheduler.add_job(push_alerts, CronTrigger(minute="*/15"), args=[app])
-    scheduler.start()
-
-    if CFG.force_chat_id:
-        try:
-            await app.bot.send_message(chat_id=int(CFG.force_chat_id), text="🤖 Crypto Cycle Watch bot started.")
-        except Exception as e:
-            log.warning("Unable to notify force_chat_id: %s", e)
-
-    log.info("Bot running. Press Ctrl+C to exit.")
-
-    await app.initialize()
-    await app.start()
-
-    # Start fetching updates from Telegram (long polling)
-    await app.updater.start_polling(drop_pending_updates=True)   # <<< NEW
-    # (Upgrader.start_polling is the official way to begin polling without run_polling)
-    # Docs: Updater.start_polling(...)  :contentReference[oaicite:1]{index=1}
-
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        # Stop polling first, then stop the application
-        await app.updater.stop()          # <<< NEW
-        await app.stop()
-        await app.shutdown()
 
 if __name__ == "__main__":
     try:
