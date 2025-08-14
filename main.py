@@ -366,9 +366,108 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUBSCRIBERS.add(update.effective_chat.id)
     await update.message.reply_text(
         "👋 Crypto Cycle Watch online.\n"
-        "Commands: /status, /subscribe, /unsubscribe, /risk <conservative|moderate|aggressive>, "
+        "Commands: /status, /subscribe, /assess, /unsubscribe, /risk <conservative|moderate|aggressive>, "
         "/getrisk, /settime HH:MM."
     )
+
+
+async def cmd_assess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show a full, per-metric assessment vs thresholds for this chat's profile."""
+    chat_id = update.effective_chat.id if update and update.effective_chat else None
+    dc = DataClient()
+    try:
+        m = await gather_metrics(dc)
+        # pick thresholds by chat/profile
+        t = get_thresholds_for_chat(chat_id)
+        profile = (
+            CHAT_PROFILE.get(chat_id, CFG.default_profile)
+            if CFG.risk_profiles else "static"
+        )
+
+        def flag_mark(is_flag: bool) -> str:
+            return "🚨" if is_flag else "✅"
+
+        lines = []
+        lines.append(f"🧪 *Current Assessment* (`{m['timestamp']}` UTC)")
+        lines.append(f"• Profile: *{profile}*")
+        lines.append("")
+
+        # BTC dominance
+        dom = float(m["btc_dominance_pct"])
+        f_dom = dom >= float(t["btc_dominance_max"])
+        lines.append(
+            f"{flag_mark(f_dom)} BTC dominance: *{dom:.2f}%*  (flag ≥ {t['btc_dominance_max']:.2f}%)"
+        )
+
+        # ETH/BTC
+        ethbtc = float(m["eth_btc"])
+        f_ethbtc = ethbtc >= float(t["eth_btc_ratio_max"])
+        lines.append(
+            f"{flag_mark(f_ethbtc)} ETH/BTC: *{ethbtc:.5f}*  (flag ≥ {t['eth_btc_ratio_max']:.5f})"
+        )
+
+        # Altcap/BTC
+        altbtc = float(m["altcap_btc_ratio"])
+        f_altbtc = altbtc >= float(t["altcap_btc_ratio_max"])
+        lines.append(
+            f"{flag_mark(f_altbtc)} Altcap/BTC: *{altbtc:.2f}*  (flag ≥ {t['altcap_btc_ratio_max']:.2f})"
+        )
+
+        # Funding extremes (max abs across configured symbols)
+        max_fr = None
+        max_sym = None
+        for sym, d in m["funding"].items():
+            fr_pct = abs(float(d.get("lastFundingRate", 0.0)) * 100.0)
+            if max_fr is None or fr_pct > max_fr:
+                max_fr, max_sym = fr_pct, sym
+        f_fund = (max_fr or 0.0) >= float(t["funding_rate_abs_max"])
+        lines.append(
+            f"{flag_mark(f_fund)} Funding (max |8h|): *{max_fr:.3f}%* on *{max_sym}*  (flag ≥ {t['funding_rate_abs_max']:.3f}%)"
+            if max_sym else
+            f"{flag_mark(False)} Funding: n/a"
+        )
+
+        # Open interest (USD est)
+        btc_oi = m["open_interest_usd"].get("BTCUSDT")
+        eth_oi = m["open_interest_usd"].get("ETHUSDT")
+        f_btc_oi = bool(btc_oi and btc_oi >= float(
+            t["open_interest_btc_usdt_usd_max"]))
+        f_eth_oi = bool(eth_oi and eth_oi >= float(
+            t["open_interest_eth_usdt_usd_max"]))
+        lines.append(
+            f"{flag_mark(f_btc_oi)} BTC OI est: *${(btc_oi or 0):,.0f}*  (flag ≥ ${t['open_interest_btc_usdt_usd_max']:,.0f})"
+        )
+        lines.append(
+            f"{flag_mark(f_eth_oi)} ETH OI est: *${(eth_oi or 0):,.0f}*  (flag ≥ ${t['open_interest_eth_usdt_usd_max']:,.0f})"
+        )
+
+        # Google Trends
+        gavg = float(m["google_trends_avg7d"])
+        f_trends = gavg >= float(t["google_trends_7d_avg_min"])
+        lines.append(
+            f"{flag_mark(f_trends)} Google Trends 7d avg: *{gavg:.1f}*  (flag ≥ {t['google_trends_7d_avg_min']:.1f})"
+        )
+
+        # Optional on-chain (MVRV Z)
+        if m.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None:
+            mz = float(m["mvrv_z"])
+            f_mz = mz >= float(t["mvrv_z_extreme"])
+            lines.append(
+                f"{flag_mark(f_mz)} BTC MVRV Z-Score: *{mz:.2f}*  (flag ≥ {t['mvrv_z_extreme']:.2f})"
+            )
+
+        # Final summary of flags using the existing helper
+        nflags, flags = evaluate_flags(m, t)
+        lines.append("")
+        if nflags > 0:
+            lines.append(
+                f"⚠️ *Triggered flags ({nflags}):* " + ", ".join(flags))
+        else:
+            lines.append("✅ *No flags* at current thresholds.")
+
+        await update.message.reply_markdown("\n".join(lines))
+    finally:
+        await dc.close()
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -507,6 +606,7 @@ async def main():
     app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CommandHandler("risk", cmd_risk))
     app.add_handler(CommandHandler("getrisk", cmd_getrisk))
+    app.add_handler(CommandHandler("assess", cmd_assess))
 
     load_profiles()
 
