@@ -24,8 +24,10 @@ DEFAULTS: Dict[str, Any] = {
         "funding": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"],
         "oi": ["BTCUSDT", "ETHUSDT"],
         # Equal-weight ALT basket (spot pairs on OKX)
-        "alt_basket": ["SOL-USDT", "XRP-USDT", "DOGE-USDT", "ADA-USDT",
-                       "BNB-USDT", "AVAX-USDT", "LINK-USDT", "MATIC-USDT"],
+        "alt_basket": [
+            "SOL-USDT", "XRP-USDT", "DOGE-USDT", "ADA-USDT",
+            "BNB-USDT", "AVAX-USDT", "LINK-USDT", "MATIC-USDT"
+        ],
     },
     "thresholds": {
         # general 3-color banding
@@ -59,11 +61,11 @@ DEFAULTS: Dict[str, Any] = {
         "btc_weekly_rsi_warn": 60.0,
         "ethbtc_weekly_rsi_flag": 65.0,
         "ethbtc_weekly_rsi_warn": 55.0,
-        "alt_weekly_rsi_flag": 75.0,   # NEW: ALT basket thresholds
+        "alt_weekly_rsi_flag": 75.0,   # ALT basket thresholds
         "alt_weekly_rsi_warn": 65.0,
         "stochrsi_overbought": 0.80,   # K/D zone
-        "fib_warn_pct": 0.03,          # 3% away
-        "fib_flag_pct": 0.015,         # 1.5% away
+        "fib_warn_pct": 0.03,          # 3% away (warn if nearer)
+        "fib_flag_pct": 0.015,         # 1.5% away (flag if nearer)
 
         # Composite score thresholds
         "composite_warn": 40,          # Yellow at/above this score
@@ -223,22 +225,24 @@ HEADERS = {"User-Agent": "crypto-cycle-bot/2.0", "Accept": "application/json"}
 
 
 def to_okx_instId(sym: str) -> str:
-    if sym.endswith("USDT"):
-        base, quote = sym[:-5], "USDT"
-    elif sym.endswith("USD"):
-        base, quote = sym[:-3], "USD"
+    s = sym.upper()
+    if s.endswith("USDT"):
+        base, quote = s[:-4], "USDT"   # fixed: 4 chars
+    elif s.endswith("USD"):
+        base, quote = s[:-3], "USD"
     else:
-        base, quote = sym, "USDT"
+        base, quote = s, "USDT"
     return f"{base}-{quote}-SWAP"
 
 
 def to_okx_uly(sym: str) -> str:
-    if sym.endswith("USDT"):
-        base, quote = sym[:-5], "USDT"
-    elif sym.endswith("USD"):
-        base, quote = sym[:-3], "USD"
+    s = sym.upper()
+    if s.endswith("USDT"):
+        base, quote = s[:-4], "USDT"   # fixed: 4 chars
+    elif s.endswith("USD"):
+        base, quote = s[:-3], "USD"
     else:
-        base, quote = sym, "USDT"
+        base, quote = s, "USDT"
     return f"{base}-{quote}"
 
 
@@ -289,7 +293,7 @@ class DataClient:
                                 {"vs_currency": "usd", "days": days, "interval": "daily"})
         return [float(p[1]) for p in data.get("prices", [])]
 
-    # CoinMarketCap (conditional on key) — no TOTAL3 probing
+    # CoinMarketCap (conditional on key)
     def _cmc_headers(self) -> Dict[str, str]:
         key = os.getenv("CMC_API_KEY", "")
         return {"X-CMC_PRO_API_KEY": key} if key else {}
@@ -401,6 +405,16 @@ class DataClient:
     async def okx_weekly_closes(self, instId: str, limit: int = 400) -> List[float]:
         data = await fetch_json(self.client, f"{OKX_BASE}/api/v5/market/candles",
                                 {"instId": instId, "bar": "1W", "limit": limit})
+        rows = data.get("data", [])
+        try:
+            rows = sorted(rows, key=lambda r: int(r[0]))  # ascending time
+        except Exception:
+            pass
+        return [float(r[4]) for r in rows if len(r) > 4]
+
+    async def okx_daily_closes(self, instId: str, limit: int = 500) -> List[float]:
+        data = await fetch_json(self.client, f"{OKX_BASE}/api/v5/market/candles",
+                                {"instId": instId, "bar": "1D", "limit": limit})
         rows = data.get("data", [])
         try:
             rows = sorted(rows, key=lambda r: int(r[0]))  # ascending time
@@ -601,7 +615,7 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
     eth_mcap = total_mcap * (eth_pct / 100.0) if total_mcap else 0.0
     altcap_calc = max(total_mcap - btc_mcap - eth_mcap, 0.0)
 
-    # Altcap via internal calculation only (TOTAL3 probe removed)
+    # Altcap via internal calculation only
     altcap_mcap = altcap_calc
     altcap_btc_ratio = (altcap_mcap / btc_mcap) if btc_mcap > 0 else 0.0
 
@@ -665,13 +679,18 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
     mvrv_z = await _safe(dc.glassnode_mvrv_z("BTC"), None, "glassnode_mvrv_z")
     exch_inflow = await _safe(dc.glassnode_exchange_inflow("BTC"), None, "glassnode_exchange_inflow")
 
-    btc_daily = await _safe(dc.coingecko_btc_daily("max"), [], "btc_daily")
+    # --- Pi Cycle inputs: prefer CoinGecko daily; fallback to OKX spot daily
+    btc_daily: List[float] = await _safe(dc.coingecko_btc_daily("max"), [], "btc_daily")
     if len(btc_daily) < 350:
-        btc_daily = await _safe(dc.coingecko_btc_daily(1500), btc_daily, "btc_daily1500")
+        if not btc_daily:
+            btc_daily = await _safe(dc.coingecko_btc_daily(1500), btc_daily, "btc_daily1500")
+        if len(btc_daily) < 350:
+            btc_daily = await _safe(dc.coingecko_btc_daily(500), btc_daily, "btc_daily500")
     if len(btc_daily) < 350:
-        btc_daily = await _safe(dc.coingecko_btc_daily(500), btc_daily, "btc_daily500")
-    sma111 = _sma(btc_daily, 111)
-    sma350 = _sma(btc_daily, 350)
+        btc_daily = await _safe(dc.okx_daily_closes("BTC-USDT", 500), [], "btc_daily_okx")
+
+    sma111 = _sma(btc_daily, 111) if btc_daily else None
+    sma350 = _sma(btc_daily, 350) if btc_daily else None
     two_350 = (2.0 * sma350) if (sma350 is not None) else None
     pi_ratio = (sma111 / two_350) if (sma111 and two_350) else None
 
@@ -699,7 +718,7 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
     def proximity_pct(price: float, target: float) -> float:
         return abs(price - target) / target if target else 1.0
 
-    # ===== NEW: Equal-weight ALT basket momentum (weekly) =====
+    # ===== Equal-weight ALT basket momentum (weekly) =====
     alt_ids = CFG.symbols.get("alt_basket", [])
     alt_series: Dict[str, List[float]] = {}
     for inst in alt_ids:
@@ -773,7 +792,7 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
         "fib_ext": fib,
         "fib_nearest": fib_nearest,
         "fib_nearest_pct": fib_nearest_pct,
-        # NEW: ALT basket
+        # ALT basket
         "alt_weekly_rsi": alt_rsi_val,
         "alt_weekly_stoch_k": alt_k_last,
         "alt_weekly_stoch_d": alt_d_last,
@@ -897,7 +916,7 @@ def compute_alt_top_certainty(m: Dict[str, Any], t: Dict[str, Any]) -> Tuple[int
     k_last = mom.get("btc_weekly_stoch_k")
     d_last = mom.get("btc_weekly_stoch_d")
     fib_pct = mom.get("fib_nearest_pct")
-    # NEW: ALT basket
+    # ALT basket
     rsi_alt = mom.get("alt_weekly_rsi")
     k_alt = mom.get("alt_weekly_stoch_k")
     d_alt = mom.get("alt_weekly_stoch_d")
@@ -928,7 +947,7 @@ def compute_alt_top_certainty(m: Dict[str, Any], t: Dict[str, Any]) -> Tuple[int
     subs["fib_btc"] = fib_risk(fib_pct, t.get(
         "fib_warn_pct", 0.03), t.get("fib_flag_pct", 0.015))
 
-    # NEW ALT basket subs
+    # ALT basket subs
     subs["rsi_alt_w"] = above_ratio(rsi_alt, t.get(
         "alt_weekly_rsi_warn", 65), t.get("alt_weekly_rsi_flag", 75))
     subs["stoch_alt_w"] = stoch_cross_risk(
@@ -943,7 +962,6 @@ def compute_alt_top_certainty(m: Dict[str, Any], t: Dict[str, Any]) -> Tuple[int
         "trends": 0.05, "fear_greed": 0.05, "fng_ma14": 0.04, "fng_ma30": 0.04, "fng_persist": 0.06,
         "pi_cycle": 0.04, "mvrv_z": 0.04,
         "rsi_btc_w": 0.06, "rsi_ethbtc_w": 0.06, "stoch_btc_w": 0.06, "fib_btc": 0.06,
-        # NEW: ALT basket contributions
         "rsi_alt_w": 0.07, "stoch_alt_w": 0.07, "fib_alt": 0.07,
     }
     total_w = sum(weights.values())
@@ -1080,7 +1098,7 @@ def build_status_text(m: Dict[str, Any], t: Dict[str, Any], profile_name: str = 
         alt_sev_fib = "red" if alt_fib_pct < fib_flag_pct else (
             "yellow" if alt_fib_pct < fib_warn_pct else "green")
 
-    # Precompute display thresholds to avoid nested f-strings
+    # Precompute display thresholds (avoid nested f-strings)
     warn_dom = t['warn_fraction'] * t['btc_dominance_max']
     warn_ethbtc = t['warn_fraction'] * t['eth_btc_ratio_max']
     warn_altbtc = t['warn_fraction'] * t['altcap_btc_ratio_max']
@@ -1185,9 +1203,9 @@ def build_status_text(m: Dict[str, Any], t: Dict[str, Any], profile_name: str = 
     fib_val = "n/a" if (
         fib_near is None or fib_pct is None) else f"{fib_near} @ {fib_pct*100:.2f}% away"
     lines.append(f"• BTC Fibonacci extension proximity: {bullet3(sev_fib)} {b(fib_val)} "
-                 f"(warn < {fib_warn_pct*100:.1f}%, flag < {fib_flag_pct*100:.1f}%)")
+                 f"(warn ≤ {fib_warn_pct*100:.1f}%, flag ≤ {fib_flag_pct*100:.1f}%)")
 
-    # NEW: ALT basket
+    # ALT basket
     sev_rsi_alt = severity_above(rsi_alt, t.get(
         "alt_weekly_rsi_flag", 75), t.get("warn_fraction", 0.8))
     alt_stoch_val = "n/a" if (
@@ -1200,7 +1218,7 @@ def build_status_text(m: Dict[str, Any], t: Dict[str, Any], profile_name: str = 
     lines.append(f"• ALT basket Stoch RSI (1W) K/D: {bullet3(alt_stoch_sev)} {b(alt_stoch_val)} "
                  f"(overbought ≥ {overb:.2f}; red = bearish cross from OB)")
     lines.append(f"• ALT basket Fibonacci proximity: {bullet3(alt_sev_fib)} {b(alt_fib_val)} "
-                 f"(warn < {fib_warn_pct*100:.1f}%, flag < {fib_flag_pct*100:.1f}%)")
+                 f"(warn ≤ {fib_warn_pct*100:.1f}%, flag ≤ {fib_flag_pct*100:.1f}%)")
     lines.append("")
 
     # Composite
@@ -1290,7 +1308,7 @@ def evaluate_flags(m: Dict[str, Any], t: Dict[str, Any]) -> Tuple[int, List[str]
     if k is not None and d is not None and k < d and max(k, d) >= ob:
         flags.append("Weekly Stoch RSI bearish cross from overbought (BTC)")
 
-    # NEW: Weekly momentum cluster (ALT basket)
+    # Weekly momentum cluster (ALT basket)
     k_alt = mom.get("alt_weekly_stoch_k")
     d_alt = mom.get("alt_weekly_stoch_d")
     if k_alt is not None and d_alt is not None and k_alt < d_alt and max(k_alt, d_alt) >= ob:
