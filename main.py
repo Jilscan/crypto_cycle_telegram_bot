@@ -78,7 +78,6 @@ def load_config(path: str = "config.yml") -> "Config":
     try:
         with open(path, "r") as f:
             raw = yaml.safe_load(f) or {}
-        # deep merge defaults <- file
 
         def deep_merge(base, extra):
             if isinstance(base, dict) and isinstance(extra, dict):
@@ -141,11 +140,25 @@ def get_thresholds_for_chat(chat_id: Optional[int]) -> Dict[str, Any]:
 # ───────────────────────────
 
 
-HEADERS = {"User-Agent": "crypto-cycle-bot/1.0"}
+OKX_BASE = "https://www.okx.com"
+HEADERS = {"User-Agent": "crypto-cycle-bot/1.1", "Accept": "application/json"}
+
+
+def to_okx_instId(sym: str) -> str:
+    # "BTCUSDT" -> "BTC-USDT-SWAP"
+    if sym.endswith("USDT"):
+        base = sym[:-5]
+        quote = "USDT"
+    elif sym.endswith("USD"):
+        base = sym[:-3]
+        quote = "USD"
+    else:
+        base = sym
+        quote = "USDT"
+    return f"{base}-{quote}-SWAP"
 
 
 async def fetch_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any] | None = None) -> Any:
-    # retry x3 with small backoff
     for attempt in range(3):
         try:
             r = await client.get(url, params=params, headers=HEADERS, timeout=20)
@@ -177,7 +190,7 @@ class DataClient:
     async def coingecko_global(self) -> Dict[str, Any]:
         return await fetch_json(self.client, "https://api.coingecko.com/api/v3/global")
 
-    # ETH/BTC via CoinGecko (avoid Binance)
+    # ETH/BTC via CoinGecko
     async def coingecko_eth_btc(self) -> float:
         data = await fetch_json(
             self.client,
@@ -188,24 +201,22 @@ class DataClient:
         btc_usd = float(data["bitcoin"]["usd"])
         return eth_usd / btc_usd
 
-    # Bybit v5 public endpoints (no key needed)
-    # Docs: /v5/market/tickers, /v5/market/history-fund-rate, /v5/market/open-interest
-    async def bybit_ticker_last_price(self, symbol: str, category: str = "linear") -> Optional[float]:
-        data = await fetch_json(self.client, "https://api.bybit.com/v5/market/tickers",
-                                {"category": category, "symbol": symbol})
+    # ── OKX v5 public endpoints (no API key needed) ─────────────────────────
+    async def okx_ticker_last_price(self, instId: str) -> Optional[float]:
+        data = await fetch_json(self.client, f"{OKX_BASE}/api/v5/market/ticker", {"instId": instId})
         try:
-            lst = data.get("result", {}).get("list", [])
+            lst = data.get("data", [])
             if lst:
-                return float(lst[0]["lastPrice"])
+                return float(lst[0]["last"])
         except Exception:
             pass
         return None
 
-    async def bybit_funding_rate(self, symbol: str) -> Optional[float]:
-        data = await fetch_json(self.client, "https://api.bybit.com/v5/market/history-fund-rate",
-                                {"category": "linear", "symbol": symbol, "limit": 1})
+    async def okx_funding_rate(self, instId: str) -> Optional[float]:
+        # current period funding rate
+        data = await fetch_json(self.client, f"{OKX_BASE}/api/v5/public/funding-rate", {"instId": instId})
         try:
-            lst = data.get("result", {}).get("list", [])
+            lst = data.get("data", [])
             if lst:
                 # decimal, e.g., 0.001 = 0.1%
                 return float(lst[0]["fundingRate"])
@@ -213,19 +224,37 @@ class DataClient:
             pass
         return None
 
-    async def bybit_open_interest(self, symbol: str, interval: str = "5min") -> Optional[float]:
-        data = await fetch_json(self.client, "https://api.bybit.com/v5/market/open-interest",
-                                {"category": "linear", "symbol": symbol, "intervalTime": interval, "limit": 1})
+    async def okx_open_interest_usd(self, instId: str) -> Optional[float]:
+        data = await fetch_json(self.client, f"{OKX_BASE}/api/v5/public/open-interest", {"instId": instId})
         try:
-            lst = data.get("result", {}).get("list", [])
+            lst = data.get("data", [])
             if lst:
-                # contracts; ~1 contract per coin on USDT linear
-                return float(lst[0]["openInterest"])
+                oi_usd = lst[0].get("oiUsd")
+                if oi_usd is not None:
+                    return float(oi_usd)
         except Exception:
             pass
         return None
 
-    # Optional: Glassnode (requires key + enable=true in config)
+    # Google Trends (blocking lib → run in a thread)
+    async def google_trends_score(self, keywords: List[str]) -> Tuple[float, Dict[str, float]]:
+        import pandas as pd  # noqa
+        from pytrends.request import TrendReq  # type: ignore
+
+        def _fetch():
+            py = TrendReq(hl="en-US", tz=0)
+            py.build_payload(kw_list=keywords, timeframe="now 7-d", geo="")
+            df = py.interest_over_time()
+            if df is None or df.empty:
+                return 0.0, {k: 0.0 for k in keywords}
+            means = {k: float(pd.to_numeric(
+                df[k], errors="coerce").mean()) for k in keywords}
+            avg = sum(means.values()) / max(len(means), 1)
+            return avg, means
+
+        return await asyncio.to_thread(_fetch)
+
+    # Optional: Glassnode (requires key + enable=true)
     async def glassnode_mvrv_z(self, asset: str = "BTC") -> Optional[float]:
         if not (CFG.glassnode.get("enable") and CFG.glassnode.get("api_key")):
             return None
@@ -252,7 +281,6 @@ class DataClient:
 
 
 async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
-    # Safe fetches (defaults on failure)
     cg = await _safe(
         dc.coingecko_global(),
         {"data": {"total_market_cap": {"usd": 0.0},
@@ -261,22 +289,20 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
     )
     ethbtc = await _safe(dc.coingecko_eth_btc(), 0.0, "coingecko_eth_btc")
 
-    # funding + last price (Bybit)
+    # funding + last price (OKX)
     funding: Dict[str, Dict[str, Any]] = {}
     for sym in CFG.symbols["funding"]:
-        fr = await _safe(dc.bybit_funding_rate(sym), 0.0, f"funding {sym}")
-        lp = await _safe(dc.bybit_ticker_last_price(sym), 0.0, f"lastPrice {sym}")
+        inst = to_okx_instId(sym)
+        fr = await _safe(dc.okx_funding_rate(inst), 0.0, f"funding {inst}")
+        lp = await _safe(dc.okx_ticker_last_price(inst), 0.0, f"lastPrice {inst}")
         funding[sym] = {"lastFundingRate": fr or 0.0, "markPrice": lp or 0.0}
 
-    # open interest ~ USD estimate
+    # open interest USD (OKX)
     oi_usd: Dict[str, Optional[float]] = {}
     for sym in CFG.symbols["oi"]:
-        oi_contracts = await _safe(dc.bybit_open_interest(sym), None, f"openInterest {sym}")
-        last_price = funding.get(sym, {}).get("markPrice") or await _safe(dc.bybit_ticker_last_price(sym), 0.0, f"lastPrice {sym}")
-        if oi_contracts is not None and last_price:
-            oi_usd[sym] = oi_contracts * last_price
-        else:
-            oi_usd[sym] = None
+        inst = to_okx_instId(sym)
+        notional = await _safe(dc.okx_open_interest_usd(inst), None, f"openInterestUSD {inst}")
+        oi_usd[sym] = notional
 
     # market-cap layout
     total_mcap = float(((cg or {}).get("data", {}).get(
@@ -350,18 +376,22 @@ def evaluate_flags(m: Dict[str, Any], t: Dict[str, Any]) -> Tuple[int, List[str]
         flags.append("ETH/BTC elevated")
     if m["altcap_btc_ratio"] >= t["altcap_btc_ratio_max"]:
         flags.append("Altcap/BTC stretched")
+    # funding (max abs)
     for sym, d in m["funding"].items():
         fr_pct = abs(float(d.get("lastFundingRate", 0.0)) * 100.0)
         if fr_pct >= t["funding_rate_abs_max"]:
             flags.append(f"Funding extreme: {sym} ({fr_pct:.3f}%)")
             break
+    # open interest notional USD (if available)
     oi = m["open_interest_usd"]
     if oi.get("BTCUSDT") and oi["BTCUSDT"] >= t["open_interest_btc_usdt_usd_max"]:
         flags.append(f"BTC OI high (${oi['BTCUSDT']:,.0f})")
     if oi.get("ETHUSDT") and oi["ETHUSDT"] >= t["open_interest_eth_usdt_usd_max"]:
         flags.append(f"ETH OI high (${oi['ETHUSDT']:,.0f})")
+    # google trends
     if m["google_trends_avg7d"] >= t["google_trends_7d_avg_min"]:
         flags.append("Retail interest (Google) high")
+    # on-chain optional
     if m.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None and m["mvrv_z"] >= t["mvrv_z_extreme"]:
         flags.append("MVRV Z-Score extreme")
     return len(flags), flags
@@ -618,6 +648,46 @@ def parse_hhmm(hhmm: str) -> Tuple[int, int]:
     return int(hh), int(mm)
 
 # ───────────────────────────
+# Alerts / Summaries
+# ───────────────────────────
+
+
+async def push_summary(app: Application):
+    dc = DataClient()
+    try:
+        m = await gather_metrics(dc)
+        text = build_status_text(m)
+        t = get_thresholds_for_chat(None)
+        n, flags = evaluate_flags(m, t)
+        if n > 0:
+            text += "\n\n⚠️ Flags: " + ", ".join(flags)
+        for chat_id in set(SUBSCRIBERS):
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            except Exception as e:
+                log.warning("Failed to send summary to %s: %s", chat_id, e)
+    finally:
+        await dc.close()
+
+
+async def push_alerts(app: Application):
+    dc = DataClient()
+    try:
+        m = await gather_metrics(dc)
+        t = get_thresholds_for_chat(None)
+        n, flags = evaluate_flags(m, t)
+        if n >= t.get("min_flags_for_alert", 3):
+            text = "🚨 *Top Risk Alert*\n" + \
+                build_status_text(m) + "\n\n⚠️ Flags: " + ", ".join(flags)
+            for chat_id in set(SUBSCRIBERS):
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                except Exception as e:
+                    log.warning("Failed to send alert to %s: %s", chat_id, e)
+    finally:
+        await dc.close()
+
+# ───────────────────────────
 # Main
 # ───────────────────────────
 
@@ -679,46 +749,6 @@ async def main():
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
-
-# ───────────────────────────
-# Alerts / Summaries
-# ───────────────────────────
-
-
-async def push_summary(app: Application):
-    dc = DataClient()
-    try:
-        m = await gather_metrics(dc)
-        text = build_status_text(m)
-        t = get_thresholds_for_chat(None)
-        n, flags = evaluate_flags(m, t)
-        if n > 0:
-            text += "\n\n⚠️ Flags: " + ", ".join(flags)
-        for chat_id in set(SUBSCRIBERS):
-            try:
-                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-            except Exception as e:
-                log.warning("Failed to send summary to %s: %s", chat_id, e)
-    finally:
-        await dc.close()
-
-
-async def push_alerts(app: Application):
-    dc = DataClient()
-    try:
-        m = await gather_metrics(dc)
-        t = get_thresholds_for_chat(None)
-        n, flags = evaluate_flags(m, t)
-        if n >= t.get("min_flags_for_alert", 3):
-            text = "🚨 *Top Risk Alert*\n" + \
-                build_status_text(m) + "\n\n⚠️ Flags: " + ", ".join(flags)
-            for chat_id in set(SUBSCRIBERS):
-                try:
-                    await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-                except Exception as e:
-                    log.warning("Failed to send alert to %s: %s", chat_id, e)
-    finally:
-        await dc.close()
 
 if __name__ == "__main__":
     try:
