@@ -19,7 +19,7 @@ from telegram.ext import Application, ApplicationBuilder, CommandHandler, Contex
 
 DEFAULTS: Dict[str, Any] = {
     "telegram": {"token": ""},  # prefer TELEGRAM_TOKEN env on Koyeb
-    "schedule": {"daily_summary_time": "13:00"},
+    "schedule": {"daily_summary_time": "13:00"},  # UTC on Koyeb by default
     "symbols": {
         "funding": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"],
         "oi": ["BTCUSDT", "ETHUSDT"],
@@ -35,8 +35,7 @@ DEFAULTS: Dict[str, Any] = {
         "google_trends_7d_avg_min": 75,
         "mvrv_z_extreme": 7.0,
         "fear_greed_greed_min": 70,        # Greed threshold (0-100)
-        # 111DMA / (2*350DMA) ratio at/above which we flag
-        "pi_cycle_ratio_min": 0.98,
+        "pi_cycle_ratio_min": 0.98,        # 111DMA / (2*350DMA)
     },
     "glassnode": {"api_key": "", "enable": False},
     "force_chat_id": "",
@@ -159,13 +158,17 @@ def get_thresholds_for_chat(chat_id: Optional[int]) -> Dict[str, Any]:
             return prof.get("thresholds", CFG.thresholds)
     return CFG.thresholds
 
+
+def get_profile_for_chat(chat_id: Optional[int]) -> str:
+    return CHAT_PROFILE.get(chat_id, CFG.default_profile) if CFG.risk_profiles else "static"
+
 # ───────────────────────────
 # HTTP helpers & data clients
 # ───────────────────────────
 
 
 OKX_BASE = "https://www.okx.com"
-HEADERS = {"User-Agent": "crypto-cycle-bot/1.3", "Accept": "application/json"}
+HEADERS = {"User-Agent": "crypto-cycle-bot/1.4", "Accept": "application/json"}
 
 
 def to_okx_instId(sym: str) -> str:
@@ -182,10 +185,24 @@ def to_okx_instId(sym: str) -> str:
     return f"{base}-{quote}-SWAP"
 
 
+def to_okx_uly(sym: str) -> str:
+    # "BTCUSDT" -> "BTC-USDT"
+    if sym.endswith("USDT"):
+        base = sym[:-5]
+        quote = "USDT"
+    elif sym.endswith("USD"):
+        base = sym[:-3]
+        quote = "USD"
+    else:
+        base = sym
+        quote = "USDT"
+    return f"{base}-{quote}"
+
+
 async def fetch_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any] | None = None) -> Any:
     for attempt in range(3):
         try:
-            r = await client.get(url, params=params, headers=HEADERS, timeout=20)
+            r = await client.get(url, params=params, headers=HEADERS, timeout=25)
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -214,7 +231,7 @@ class DataClient:
     async def coingecko_global(self) -> Dict[str, Any]:
         return await fetch_json(self.client, "https://api.coingecko.com/api/v3/global")
 
-    # ETH/BTC via CoinGecko
+    # ETH/BTC via CoinGecko (simple)
     async def coingecko_eth_btc(self) -> float:
         data = await fetch_json(
             self.client,
@@ -226,7 +243,7 @@ class DataClient:
         return eth_usd / btc_usd
 
     # BTC daily closes for Pi Cycle (CoinGecko)
-    async def coingecko_btc_daily(self, days: int = 500) -> List[float]:
+    async def coingecko_btc_daily(self, days: str | int = "max") -> List[float]:
         data = await fetch_json(
             self.client,
             "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
@@ -257,8 +274,7 @@ class DataClient:
             pass
         return None
 
-    async def okx_open_interest_usd(self, instId: str) -> Optional[float]:
-        # include instType; prefer oiUsd; fallback to oiCcy * last price
+    async def okx_open_interest_usd_by_inst(self, instId: str) -> Optional[float]:
         data = await fetch_json(
             self.client,
             f"{OKX_BASE}/api/v5/public/open-interest",
@@ -272,8 +288,9 @@ class DataClient:
             val = row.get("oiUsd")
             if val not in (None, "", "0"):
                 return float(val)
+            # fallback using oiCcy * last
             oi_ccy = row.get("oiCcy")
-            if oi_ccy not in (None, ""):
+            if oi_ccy not in (None, "", "0"):
                 last = await _safe(self.okx_ticker_last_price(instId), None, f"lastPrice {instId}")
                 if last:
                     return float(oi_ccy) * float(last)
@@ -281,53 +298,34 @@ class DataClient:
             pass
         return None
 
-    # Google Trends (blocking lib → run in a thread)
-    async def google_trends_score(self, keywords: List[str]) -> Tuple[float, Dict[str, float]]:
-        import pandas as pd  # noqa
-        from pytrends.request import TrendReq  # type: ignore
-
-        def _fetch():
-            py = TrendReq(hl="en-US", tz=0)
-            py.build_payload(kw_list=keywords, timeframe="now 7-d", geo="")
-            df = py.interest_over_time()
-            if df is None or df.empty:
-                return 0.0, {k: 0.0 for k in keywords}
-            means = {k: float(pd.to_numeric(
-                df[k], errors="coerce").mean()) for k in keywords}
-            avg = sum(means.values()) / max(len(means), 1)
-            return avg, means
-
-        return await asyncio.to_thread(_fetch)
-
-    # Fear & Greed (alternative.me)
-    async def fear_greed(self) -> Tuple[Optional[int], Optional[str]]:
-        data = await fetch_json(self.client, "https://api.alternative.me/fng/", {"limit": 1})
+    async def okx_open_interest_usd_by_uly(self, uly: str) -> Optional[float]:
+        # Aggregate OI across all SWAP instruments of the same underlying (e.g., BTC-USDT)
+        data = await fetch_json(
+            self.client,
+            f"{OKX_BASE}/api/v5/public/open-interest",
+            {"instType": "SWAP", "uly": uly}
+        )
+        total = 0.0
+        any_row = False
         try:
-            row = data.get("data", [])[0]
-            return int(row["value"]), str(row["value_classification"])
+            for row in data.get("data", []):
+                any_row = True
+                oi_usd = row.get("oiUsd")
+                if oi_usd not in (None, "", "0"):
+                    total += float(oi_usd)
+                    continue
+                # fallback per row
+                inst = row.get("instId")
+                oi_ccy = row.get("oiCcy")
+                if inst and oi_ccy not in (None, "", "0"):
+                    last = await _safe(self.okx_ticker_last_price(inst), None, f"lastPrice {inst}")
+                    if last:
+                        total += float(oi_ccy) * float(last)
         except Exception:
-            return None, None
-
-    # Optional: Glassnode (requires key + enable=true)
-    async def glassnode_mvrv_z(self, asset: str = "BTC") -> Optional[float]:
-        if not (CFG.glassnode.get("enable") and CFG.glassnode.get("api_key")):
+            pass
+        if not any_row:
             return None
-        data = await fetch_json(self.client,
-                                "https://api.glassnode.com/v1/metrics/market/mvrv_z_score",
-                                {"a": asset, "api_key": CFG.glassnode["api_key"], "i": "24h"})
-        if isinstance(data, list) and data:
-            return float(data[-1]["v"])
-        return None
-
-    async def glassnode_exchange_inflow(self, asset: str = "BTC") -> Optional[float]:
-        if not (CFG.glassnode.get("enable") and CFG.glassnode.get("api_key")):
-            return None
-        data = await fetch_json(self.client,
-                                "https://api.glassnode.com/v1/metrics/transactions/transfers_volume_to_exchanges_adjusted_sum",
-                                {"a": asset, "api_key": CFG.glassnode["api_key"], "i": "24h"})
-        if isinstance(data, list) and data:
-            return float(data[-1]["v"])
-        return None
+        return total if total > 0 else None
 
 # ───────────────────────────
 # Metrics (resilient)
@@ -357,11 +355,14 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
         lp = await _safe(dc.okx_ticker_last_price(inst), 0.0, f"lastPrice {inst}")
         funding[sym] = {"lastFundingRate": fr or 0.0, "markPrice": lp or 0.0}
 
-    # open interest USD (OKX)
+    # open interest USD (OKX) with robust fallback (instId -> uly aggregate)
     oi_usd: Dict[str, Optional[float]] = {}
     for sym in CFG.symbols["oi"]:
         inst = to_okx_instId(sym)
-        notional = await _safe(dc.okx_open_interest_usd(inst), None, f"openInterestUSD {inst}")
+        uly = to_okx_uly(sym)
+        notional = await _safe(dc.okx_open_interest_usd_by_inst(inst), None, f"openInterestUSD {inst}")
+        if notional is None:
+            notional = await _safe(dc.okx_open_interest_usd_by_uly(uly), None, f"openInterestUSD {uly}")
         oi_usd[sym] = notional
 
     # market-cap layout
@@ -386,8 +387,8 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
     mvrv_z = await _safe(dc.glassnode_mvrv_z("BTC"), None, "glassnode_mvrv_z")
     exch_inflow = await _safe(dc.glassnode_exchange_inflow("BTC"), None, "glassnode_exchange_inflow")
 
-    # Pi Cycle Top proximity (BTC 111DMA vs 2×350DMA)
-    btc_daily = await _safe(dc.coingecko_btc_daily(500), [], "btc_daily_prices")
+    # Pi Cycle Top proximity (BTC 111DMA vs 2×350DMA) — robust fetch
+    btc_daily = await _safe(dc.coingecko_btc_daily("max"), [], "btc_daily_prices")
     sma111 = _sma(btc_daily, 111)
     sma350 = _sma(btc_daily, 350)
     pi_ratio = None
@@ -412,10 +413,99 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
         "pi_cycle": {
             "sma111": sma111,
             "sma350x2": two_350,
-            # == 111DMA / (2*350DMA); >=1.00 is a cross/trigger
-            "ratio": pi_ratio,
+            "ratio": pi_ratio,  # == 111DMA / (2*350DMA)
         },
     }
+
+# ───────────────────────────
+# Composite score (Alt-Top Certainty 0–100)
+# ───────────────────────────
+
+
+def clamp01(x: float) -> float:
+    return 0.0 if x < 0 else 1.0 if x > 1 else x
+
+
+def compute_alt_top_certainty(m: Dict[str, Any], t: Dict[str, Any]) -> Tuple[int, Dict[str, float]]:
+    """
+    Produces a 0–100 certainty for 'altcoin cycle top risk' using normalized
+    proximity-to-thresholds. Weights adapt to the chosen risk profile via thresholds.
+    """
+    subscores: Dict[str, float] = {}
+
+    # Helpers
+    def frac(value: Optional[float], threshold: float) -> float:
+        if value is None or threshold <= 0:
+            return 0.0
+        return clamp01(value / threshold)
+
+    # Market structure
+    subscores["altcap_vs_btc"] = frac(
+        m["altcap_btc_ratio"], t["altcap_btc_ratio_max"])
+    subscores["eth_btc"] = frac(m["eth_btc"],           t["eth_btc_ratio_max"])
+    subscores["btc_dominance"] = frac(
+        m["btc_dominance_pct"], t["btc_dominance_max"])
+
+    # Derivatives
+    # max abs funding across watched pairs
+    max_fr_abs = 0.0
+    for d in (m.get("funding") or {}).values():
+        fr = abs(float(d.get("lastFundingRate", 0.0)) * 100.0)
+        if fr > max_fr_abs:
+            max_fr_abs = fr
+    subscores["funding_extreme"] = frac(max_fr_abs, t["funding_rate_abs_max"])
+
+    oi = m.get("open_interest_usd") or {}
+    subscores["oi_btc"] = frac(
+        oi.get("BTCUSDT"), t["open_interest_btc_usdt_usd_max"])
+    subscores["oi_eth"] = frac(
+        oi.get("ETHUSDT"), t["open_interest_eth_usdt_usd_max"])
+
+    # Sentiment
+    subscores["trends"] = frac(
+        m["google_trends_avg7d"], t["google_trends_7d_avg_min"])
+    fg_val = m.get("fear_greed_index")
+    subscores["fear_greed"] = frac(float(fg_val) if fg_val is not None else None,
+                                   float(t.get("fear_greed_greed_min", 70)))
+
+    # Cycle/On-chain
+    pi_ratio = (m.get("pi_cycle") or {}).get("ratio")
+    subscores["pi_cycle"] = frac(pi_ratio, t.get("pi_cycle_ratio_min", 0.98))
+
+    mz = m.get("mvrv_z")
+    subscores["mvrv_z"] = frac(
+        mz, float(t.get("mvrv_z_extreme", 7.0))) if mz is not None else 0.0
+
+    # Weights (sum ≈ 1.0). Tilted toward alt-structure + derivatives for tops.
+    weights = {
+        "altcap_vs_btc": 0.18,
+        "eth_btc":       0.14,
+        "btc_dominance": 0.08,
+        "funding_extreme": 0.12,
+        "oi_btc":        0.12,
+        "oi_eth":        0.10,
+        "trends":        0.08,
+        "fear_greed":    0.08,
+        "pi_cycle":      0.06,
+        "mvrv_z":        0.04,
+    }
+
+    # Renormalize in case some metrics are missing
+    total_w = sum(w for k, w in weights.items()
+                  if subscores.get(k, 0) > 0 or k in subscores)
+    if total_w <= 0:
+        return 0, subscores
+
+    score01 = 0.0
+    used_w = 0.0
+    for k, w in weights.items():
+        if k in subscores:
+            score01 += subscores[k] * w
+            used_w += w
+    if used_w > 0:
+        score01 /= used_w
+
+    return int(round(score01 * 100)), subscores
 
 # ───────────────────────────
 # Presentation helpers (HTML)
@@ -434,14 +524,17 @@ def fmt_usd(x: Optional[float]) -> str:
     return "n/a" if x is None else f"${x:,.0f}"
 
 
-def build_status_text(m: Dict[str, Any], t: Dict[str, Any] | None = None) -> str:
-    """Human-friendly snapshot with colored bullets on metric values."""
+def build_status_text(m: Dict[str, Any], t: Dict[str, Any] | None = None, profile_name: str = "") -> str:
+    """
+    Expanded layout with spacing between sections so things don't feel bunched up.
+    Values are bolded; flagged values show a red bullet.
+    """
     t = t or CFG.thresholds
 
-    # Flags (for coloring)
+    # Quick local flags for coloring bullets next to metric values
     flags_count, flags_list = evaluate_flags(m, t)
 
-    # Per-metric local flag checks
+    # --- Market structure ---
     dom = m["btc_dominance_pct"]
     f_dom = dom >= t["btc_dominance_max"]
     ethbtc = m["eth_btc"]
@@ -449,7 +542,7 @@ def build_status_text(m: Dict[str, Any], t: Dict[str, Any] | None = None) -> str
     altbtc = m["altcap_btc_ratio"]
     f_altbtc = altbtc >= t["altcap_btc_ratio_max"]
 
-    # funding (max abs)
+    # --- Derivatives ---
     funding = m["funding"]
     max_fr = 0.0
     max_sym = None
@@ -459,102 +552,106 @@ def build_status_text(m: Dict[str, Any], t: Dict[str, Any] | None = None) -> str
             max_fr, max_sym = fr_pct, sym
     f_fund = max_fr >= t["funding_rate_abs_max"]
 
-    # open interest
     oi = m["open_interest_usd"]
     btc_oi = oi.get("BTCUSDT")
     eth_oi = oi.get("ETHUSDT")
     f_btc_oi = bool(btc_oi and btc_oi >= t["open_interest_btc_usdt_usd_max"])
     f_eth_oi = bool(eth_oi and eth_oi >= t["open_interest_eth_usdt_usd_max"])
 
-    # Google Trends
+    # --- Sentiment ---
     gavg = m["google_trends_avg7d"]
     f_trends = gavg >= t["google_trends_7d_avg_min"]
-
-    # Fear & Greed
     fng_val = m.get("fear_greed_index")
     fng_lab = m.get("fear_greed_label")
     f_fng = bool(fng_val is not None and fng_val >=
                  t.get("fear_greed_greed_min", 70))
 
-    # Pi Cycle
+    # --- Cycle / On-chain ---
     pi = m.get("pi_cycle") or {}
     pi_ratio = pi.get("ratio")
     pi_flag = bool(pi_ratio is not None and pi_ratio >=
                    t.get("pi_cycle_ratio_min", 0.98))
+    mz_val = m.get("mvrv_z")
+    f_mz = bool(mz_val is not None and mz_val >= t.get("mvrv_z_extreme", 7.0))
+
+    # Composite certainty
+    certainty, subs = compute_alt_top_certainty(m, t)
 
     lines: List[str] = []
-    lines.append(f"📊 {b('Crypto Market Snapshot')} ({m['timestamp']} UTC)")
+    lines.append(f"📊 {b('Crypto Market Snapshot')} — {m['timestamp']} UTC")
+    if profile_name:
+        lines.append(f"Profile: {b(profile_name)}")
+    lines.append("")
 
-    lines.append(
-        f"• Bitcoin market share of total crypto market: "
-        f"{bullet(f_dom)} {b(f'{dom:.2f}%')}  (flag ≥ {t['btc_dominance_max']:.2f}%)"
-    )
+    # MARKET STRUCTURE
+    lines.append(b("Market Structure"))
+    lines.append(f"• Bitcoin market share of total crypto: {bullet(f_dom)} {b(f'{dom:.2f}%')}  "
+                 f"(flag ≥ {t['btc_dominance_max']:.2f}%)")
+    lines.append(f"• Ether price relative to Bitcoin (ETH/BTC): {bullet(f_ethbtc)} {b(f'{ethbtc:.5f}')}  "
+                 f"(flag ≥ {t['eth_btc_ratio_max']:.5f})")
+    lines.append(f"• Altcoin market cap / Bitcoin market cap: {bullet(f_altbtc)} {b(f'{altbtc:.2f}')}  "
+                 f"(flag ≥ {t['altcap_btc_ratio_max']:.2f})")
+    lines.append("")
 
-    lines.append(
-        f"• Ether price relative to Bitcoin (ETH/BTC): "
-        f"{bullet(f_ethbtc)} {b(f'{ethbtc:.5f}')}  (flag ≥ {t['eth_btc_ratio_max']:.5f})"
-    )
-
-    lines.append(
-        f"• Altcoin market cap / Bitcoin market cap: "
-        f"{bullet(f_altbtc)} {b(f'{altbtc:.2f}')}  (flag ≥ {t['altcap_btc_ratio_max']:.2f})"
-    )
-
+    # DERIVATIVES
+    lines.append(b("Derivatives"))
     if max_sym:
-        lines.append(
-            f"• Perpetual funding rate (max absolute across watched pairs): "
-            f"{bullet(f_fund)} {b(f'{max_fr:.3f}%')} on {max_sym}  "
-            f"(flag ≥ {t['funding_rate_abs_max']:.3f}%)"
-        )
+        lines.append(f"• Perpetual funding (max absolute): {bullet(f_fund)} {b(f'{max_fr:.3f}%')} on {max_sym}  "
+                     f"(flag ≥ {t['funding_rate_abs_max']:.3f}%)")
     else:
-        lines.append(f"• Perpetual funding rate: {bullet(False)} {b('n/a')}")
+        lines.append(f"• Perpetual funding: {bullet(False)} {b('n/a')}")
+    lines.append(f"• Bitcoin open interest (USD): {bullet(f_btc_oi)} {b(fmt_usd(btc_oi))}  "
+                 f"(flag ≥ {fmt_usd(t['open_interest_btc_usdt_usd_max'])})")
+    lines.append(f"• Ether open interest (USD): {bullet(f_eth_oi)} {b(fmt_usd(eth_oi))}  "
+                 f"(flag ≥ {fmt_usd(t['open_interest_eth_usdt_usd_max'])})")
+    lines.append("")
 
-    lines.append(
-        f"• Bitcoin open interest (USD, estimate): "
-        f"{bullet(f_btc_oi)} {b(fmt_usd(btc_oi))}  "
-        f"(flag ≥ {fmt_usd(t['open_interest_btc_usdt_usd_max'])})"
-    )
-
-    lines.append(
-        f"• Ether open interest (USD, estimate): "
-        f"{bullet(f_eth_oi)} {b(fmt_usd(eth_oi))}  "
-        f"(flag ≥ {fmt_usd(t['open_interest_eth_usdt_usd_max'])})"
-    )
-
-    lines.append(
-        f"• Google Trends (7-day average; crypto/bitcoin/ethereum): "
-        f"{bullet(f_trends)} {b(f'{gavg:.1f}')}  "
-        f"(flag ≥ {t['google_trends_7d_avg_min']:.1f})"
-    )
-
+    # SENTIMENT
+    lines.append(b("Sentiment"))
+    lines.append(f"• Google Trends avg (7d; crypto/bitcoin/ethereum): {bullet(f_trends)} {b(f'{gavg:.1f}')}  "
+                 f"(flag ≥ {t['google_trends_7d_avg_min']:.1f})")
     if fng_val is not None:
-        lines.append(
-            f"• Fear & Greed Index (overall crypto): "
-            f"{bullet(f_fng)} {b(str(fng_val))} ({fng_lab or 'n/a'})  "
-            f"(flag ≥ {t.get('fear_greed_greed_min', 70)})"
-        )
+        lines.append(f"• Fear & Greed Index (overall crypto): {bullet(f_fng)} {b(str(fng_val))} "
+                     f"({fng_lab or 'n/a'})  (flag ≥ {t.get('fear_greed_greed_min', 70)})")
+    else:
+        lines.append("• Fear & Greed Index: 🟢 " + b("n/a"))
+    lines.append("")
 
-    # Pi Cycle line
+    # CYCLE / ON-CHAIN
+    lines.append(b("Cycle & On-Chain"))
     if pi_ratio is not None and pi.get("sma111") and pi.get("sma350x2"):
         pct = pi_ratio * 100.0
         th_pct = t.get("pi_cycle_ratio_min", 0.98) * 100.0
         lines.append(
-            f"• Pi Cycle Top proximity (111-day MA vs 2×350-day MA): "
-            f"{bullet(pi_flag)} {b(f'{pct:.1f}% of cross')} "
+            f"• Pi Cycle Top proximity (111-DMA vs 2×350-DMA): {bullet(pi_flag)} {b(f'{pct:.1f}% of cross')}  "
             f"(111DMA {fmt_usd(pi['sma111'])}, 2×350DMA {fmt_usd(pi['sma350x2'])}; flag ≥ {th_pct:.1f}%)"
         )
     else:
         lines.append("• Pi Cycle Top proximity: 🟢 " + b("n/a"))
 
-    if m.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None:
-        mz_val = m["mvrv_z"]
-        f_mz = mz_val >= t["mvrv_z_extreme"]
-        lines.append(
-            f"• Bitcoin MVRV Z-Score (on-chain valuation): "
-            f"{bullet(f_mz)} {b(f'{mz_val:.2f}')}  "
-            f"(flag ≥ {t['mvrv_z_extreme']:.2f})"
-        )
+    if mz_val is not None:
+        lines.append(f"• Bitcoin MVRV Z-Score: {bullet(f_mz)} {b(f'{mz_val:.2f}')}  "
+                     f"(flag ≥ {t['mvrv_z_extreme']:.2f})")
+    lines.append("")
 
+    # COMPOSITE
+    lines.append(b("Alt-Top Certainty (Composite)"))
+    lines.append(f"• Certainty: {b(f'{certainty}/100')}")
+    # brief breakdown
+    nice = [
+        f"altcap_vs_btc {int(round(subs.get('altcap_vs_btc',0)*100))}%",
+        f"eth_btc {int(round(subs.get('eth_btc',0)*100))}%",
+        f"funding {int(round(subs.get('funding_extreme',0)*100))}%",
+        f"OI_BTC {int(round(subs.get('oi_btc',0)*100))}%",
+        f"OI_ETH {int(round(subs.get('oi_eth',0)*100))}%",
+        f"trends {int(round(subs.get('trends',0)*100))}%",
+        f"F&G {int(round(subs.get('fear_greed',0)*100))}%",
+        f"Pi {int(round(subs.get('pi_cycle',0)*100))}%",
+        f"MVRVZ {int(round(subs.get('mvrv_z',0)*100))}%"
+    ]
+    lines.append("• Subscores: " + ", ".join(nice))
+
+    # FLAGS SUMMARY
     if flags_count > 0:
         lines.append("")
         lines.append(
@@ -610,9 +707,16 @@ SUBSCRIBERS: set[int] = set()
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUBSCRIBERS.add(update.effective_chat.id)
     msg = (
-        "👋 Crypto Cycle Watch online.\n"
-        "Commands: /status, /assess, /assess_json, /subscribe, /unsubscribe, "
-        "/risk &lt;conservative|moderate|aggressive&gt;, /getrisk, /settime HH:MM."
+        "👋 Crypto Cycle Watch online.\n\n"
+        "Commands:\n"
+        "• /status – snapshot\n"
+        "• /assess – snapshot + flags\n"
+        "• /assess_json [pretty|compact|file] – raw data\n"
+        "• /subscribe – daily summary & alerts here\n"
+        "• /unsubscribe – stop messages\n"
+        "• /risk &lt;conservative|moderate|aggressive&gt;\n"
+        "• /getrisk – show profile\n"
+        "• /settime HH:MM – daily summary time (server/UTC)\n"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -622,11 +726,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         m = await gather_metrics(dc)
         t = get_thresholds_for_chat(update.effective_chat.id)
-        text = build_status_text(m, t)
-        if CFG.risk_profiles:
-            cur = CHAT_PROFILE.get(
-                update.effective_chat.id, CFG.default_profile)
-            text += f"\n• Active risk profile: {b(cur)}"
+        profile = get_profile_for_chat(update.effective_chat.id)
+        text = build_status_text(m, t, profile)
         await update.message.reply_text(text, parse_mode="HTML")
     finally:
         await dc.close()
@@ -644,10 +745,10 @@ async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args[0]) != 5 or context.args[0][2] != ":":
-        await update.message.reply_text("Usage: /settime HH:MM (24h)", parse_mode="HTML")
+        await update.message.reply_text("Usage: /settime HH:MM (24h, server/UTC)", parse_mode="HTML")
         return
     CFG.schedule["daily_summary_time"] = context.args[0]
-    await update.message.reply_text(f"🕒 Daily summary time set to {b(context.args[0])} (server time).", parse_mode="HTML")
+    await update.message.reply_text(f"🕒 Daily summary time set to {b(context.args[0])} (server/UTC).", parse_mode="HTML")
 
 
 async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -667,7 +768,7 @@ async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_getrisk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cur = CHAT_PROFILE.get(update.effective_chat.id, CFG.default_profile)
+    cur = get_profile_for_chat(update.effective_chat.id)
     await update.message.reply_text(f"Current risk profile: {b(cur)}", parse_mode="HTML")
 
 
@@ -686,12 +787,11 @@ async def cmd_assess(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         t = get_thresholds_for_chat(chat_id)
-        profile = (CHAT_PROFILE.get(chat_id, CFG.default_profile)
-                   if CFG.risk_profiles else "static")
+        profile = get_profile_for_chat(chat_id)
 
-        text = build_status_text(m, t)
+        text = build_status_text(m, t, profile)
         nflags, flags = evaluate_flags(m, t)
-        lines = [text, "", f"• Active risk profile: {b(profile)}"]
+        lines = [text, ""]
         if nflags > 0:
             lines.append(
                 f"⚠️ {b(f'Triggered flags ({nflags})')}: " + ", ".join(flags))
@@ -703,15 +803,15 @@ async def cmd_assess(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_assess_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return a full JSON dump of the current metrics, thresholds, and flags."""
+    """Return a full JSON dump of the current metrics, thresholds, composite score, and flags."""
     chat_id = update.effective_chat.id if update and update.effective_chat else None
     dc = DataClient()
     try:
         m = await gather_metrics(dc)
         t = get_thresholds_for_chat(chat_id)
         nflags, flags = evaluate_flags(m, t)
-        profile = (CHAT_PROFILE.get(chat_id, CFG.default_profile)
-                   if CFG.risk_profiles else "static")
+        profile = get_profile_for_chat(chat_id)
+        certainty, subs = compute_alt_top_certainty(m, t)
 
         payload = {
             "timestamp": m["timestamp"],
@@ -719,6 +819,7 @@ async def cmd_assess_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "profile": profile,
             "thresholds": t,
             "metrics": m,
+            "composite": {"alt_top_certainty": certainty, "subscores": subs},
             "flags_count": nflags,
             "flags": flags,
         }
@@ -741,7 +842,7 @@ async def cmd_assess_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = json.dumps(payload, indent=(
             2 if pretty else None), ensure_ascii=False)
 
-        # Optional webhook
+        # Optional webhook for your own logging endpoint
         webhook_status = ""
         webhook = os.getenv("JSON_WEBHOOK_URL")
         if webhook:
@@ -759,7 +860,6 @@ async def cmd_assess_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bio.seek(0)
             await update.message.reply_document(document=bio, caption=f"JSON dump{webhook_status}")
         else:
-            # No parse_mode for JSON text to avoid HTML escaping issues
             await update.message.reply_text(text + (f"\n\n{webhook_status}" if webhook_status else ""))
     finally:
         await dc.close()
@@ -791,21 +891,28 @@ def parse_hhmm(hhmm: str) -> Tuple[int, int]:
 # ───────────────────────────
 
 
+async def push_summary_for_chat(app: Application, chat_id: int, metrics: Dict[str, Any]):
+    """Build per-chat summary so each subscriber gets their own profile thresholds."""
+    t = get_thresholds_for_chat(chat_id)
+    profile = get_profile_for_chat(chat_id)
+    text = build_status_text(metrics, t, profile)
+    n, flags = evaluate_flags(metrics, t)
+    if n > 0:
+        text += "\n\n" + \
+            f"⚠️ {b(f'Triggered flags ({n})')}: " + ", ".join(flags)
+    try:
+        await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    except Exception as e:
+        log.warning("Failed to send summary to %s: %s", chat_id, e)
+
+
 async def push_summary(app: Application):
     dc = DataClient()
     try:
         m = await gather_metrics(dc)
-        t = get_thresholds_for_chat(None)
-        text = build_status_text(m, t)
-        n, flags = evaluate_flags(m, t)
-        if n > 0:
-            text += "\n\n" + \
-                f"⚠️ {b(f'Triggered flags ({n})')}: " + ", ".join(flags)
+        # send to each subscriber with their thresholds/profile
         for chat_id in set(SUBSCRIBERS):
-            try:
-                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-            except Exception as e:
-                log.warning("Failed to send summary to %s: %s", chat_id, e)
+            await push_summary_for_chat(app, chat_id, m)
     finally:
         await dc.close()
 
@@ -814,12 +921,14 @@ async def push_alerts(app: Application):
     dc = DataClient()
     try:
         m = await gather_metrics(dc)
-        t = get_thresholds_for_chat(None)
-        n, flags = evaluate_flags(m, t)
-        if n >= t.get("min_flags_for_alert", 3):
-            text = "🚨 " + b("Top Risk Alert") + "\n" + build_status_text(m, t) + "\n\n" + \
-                   f"⚠️ {b(f'Triggered flags ({n})')}: " + ", ".join(flags)
-            for chat_id in set(SUBSCRIBERS):
+        # Alert per chat according to their own thresholds
+        for chat_id in set(SUBSCRIBERS):
+            t = get_thresholds_for_chat(chat_id)
+            n, flags = evaluate_flags(m, t)
+            if n >= t.get("min_flags_for_alert", 3):
+                text = "🚨 " + b("Top Risk Alert") + "\n\n" + build_status_text(m, t, get_profile_for_chat(chat_id)) + \
+                       "\n\n" + \
+                    f"⚠️ {b(f'Triggered flags ({n})')}: " + ", ".join(flags)
                 try:
                     await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
                 except Exception as e:
@@ -854,18 +963,19 @@ async def main():
 
     load_profiles()
 
-    # Start health server first so health checks pass
+    # Health server first so health checks pass
     await start_health_server()
 
-    # Scheduler bound to current loop
+    # Scheduler bound to current loop — keeps once-a-day summary (and 15-min alerts)
     tzname = os.getenv("TZ", "UTC")
     loop = asyncio.get_running_loop()
     scheduler = AsyncIOScheduler(timezone=tzname, event_loop=loop)
 
     hh, mm = parse_hhmm(CFG.schedule.get("daily_summary_time", "13:00"))
     scheduler.add_job(push_summary, CronTrigger(
-        hour=hh, minute=mm), args=[app])
-    scheduler.add_job(push_alerts, CronTrigger(minute="*/15"), args=[app])
+        hour=hh, minute=mm), args=[app])   # daily summary
+    scheduler.add_job(push_alerts, CronTrigger(
+        minute="*/15"), args=[app])         # alert check
     scheduler.start()
 
     if CFG.force_chat_id:
@@ -885,7 +995,6 @@ async def main():
         while True:
             await asyncio.sleep(3600)
     finally:
-        # Stop polling first, then stop the application
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
