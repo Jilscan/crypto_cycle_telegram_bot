@@ -1,9 +1,8 @@
 
 import os
-from pathlib import Path
 import asyncio
 import logging
-from datetime import datetime, time, timezone
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
 import httpx
@@ -18,50 +17,42 @@ from telegram.ext import (
 )
 
 # --- tiny health-check server for Koyeb web deploys ---
-PORT = int(os.getenv("PORT", "0"))  # Koyeb sets PORT for web services
+PORT = int(os.getenv("PORT", "0"))
 if PORT:
     from aiohttp import web
-
     async def ping(request):
         return web.Response(text="ok")
     health_app = web.Application()
     health_app.add_routes([web.get("/", ping), web.get("/health", ping)])
-    # Run the server in the background
-    asyncio.get_event_loop().create_task(
-        web._run_app(health_app, host="0.0.0.0", port=PORT))
-# -------------------------------------------------------
+    asyncio.get_event_loop().create_task(web._run_app(health_app, host="0.0.0.0", port=PORT))
+# ------------------------------------------------------
 
 # -----------------------------
 # Config / Models
 # -----------------------------
 
-
 class Config(BaseModel):
     telegram: Dict[str, Any]
     schedule: Dict[str, Any]
     symbols: Dict[str, List[str]]
-    # kept for backward-compat; not used when risk_profiles present
-    thresholds: Dict[str, Any]
+    thresholds: Dict[str, Any]  # back-compat
     glassnode: Dict[str, Any] = {}
     force_chat_id: str = ""
     logging: Dict[str, Any] = {"level": "INFO"}
     default_profile: str = "moderate"
     risk_profiles: Dict[str, Dict[str, Any]] | None = None
 
-
-def load_config(path: str = "config.yml") -> Config:
+def load_config(path: str = "config.yml") -> "Config":
     with open(path, "r") as f:
         raw = yaml.safe_load(f)
     return Config(**raw)
 
-
 CFG = load_config()
 
-
 # Per-chat risk profile storage
+from pathlib import Path
 PROFILE_FILE = Path("profiles.yml")
 CHAT_PROFILE: dict[int, str] = {}
-
 
 def load_profiles():
     global CHAT_PROFILE
@@ -73,26 +64,21 @@ def load_profiles():
     else:
         CHAT_PROFILE = {}
 
-
 def save_profiles():
     try:
         PROFILE_FILE.write_text(yaml.safe_dump(CHAT_PROFILE, sort_keys=False))
     except Exception as e:
         log.warning("Failed to save profiles.yml: %s", e)
 
-
 def get_thresholds_for_chat(chat_id: Optional[int]) -> Dict[str, Any]:
-    # If risk_profiles defined, choose active; else fall back to CFG.thresholds
     if CFG.risk_profiles:
         profile = CFG.default_profile
         if chat_id is not None and chat_id in CHAT_PROFILE:
             profile = CHAT_PROFILE[chat_id]
-        prof = CFG.risk_profiles.get(
-            profile, CFG.risk_profiles.get(CFG.default_profile))
+        prof = CFG.risk_profiles.get(profile, CFG.risk_profiles.get(CFG.default_profile))
         if prof and isinstance(prof, dict):
             return prof.get("thresholds", CFG.thresholds)
     return CFG.thresholds
-
 
 # Logging
 logging.basicConfig(level=getattr(logging, CFG.logging.get("level", "INFO")))
@@ -103,7 +89,6 @@ log = logging.getLogger("crypto-cycle-bot")
 # -----------------------------
 
 HEADERS = {"User-Agent": "crypto-cycle-bot/1.0"}
-
 
 async def fetch_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any] | None = None) -> Any:
     for attempt in range(3):
@@ -120,7 +105,6 @@ async def fetch_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any]
 # Data Providers
 # -----------------------------
 
-
 class DataClient:
     def __init__(self):
         self.client = httpx.AsyncClient()
@@ -128,51 +112,40 @@ class DataClient:
     async def close(self):
         await self.client.aclose()
 
-    # CoinGecko global data
     async def coingecko_global(self) -> Dict[str, Any]:
         url = "https://api.coingecko.com/api/v3/global"
         return await fetch_json(self.client, url)
 
-    # Binance: ETHBTC price
     async def binance_price(self, symbol: str) -> float:
         url = "https://api.binance.com/api/v3/ticker/price"
         data = await fetch_json(self.client, url, params={"symbol": symbol})
         return float(data["price"])
 
-    # Binance Perp premiumIndex includes funding rate, mark price
     async def binance_premium_index(self, symbol: str) -> Dict[str, Any]:
         url = "https://fapi.binance.com/fapi/v1/premiumIndex"
         return await fetch_json(self.client, url, params={"symbol": symbol})
 
-    # Binance open interest
     async def binance_open_interest(self, symbol: str) -> Dict[str, Any]:
         url = "https://fapi.binance.com/fapi/v1/openInterest"
         return await fetch_json(self.client, url, params={"symbol": symbol})
 
-    # Google Trends via pytrends (run in a thread to avoid blocking)
     async def google_trends_score(self, keywords: List[str]) -> Tuple[float, Dict[str, float]]:
         from pytrends.request import TrendReq
         import pandas as pd
 
         def _work():
             pytrends = TrendReq(hl="en-US", tz=0)
-            pytrends.build_payload(
-                keywords, cat=0, timeframe="now 7-d", geo="", gprop="")
+            pytrends.build_payload(keywords, cat=0, timeframe="now 7-d", geo="", gprop="")
             df = pytrends.interest_over_time()
             if df.empty:
                 return 0.0, {k: 0.0 for k in keywords}
-            # average last 7d scores, dropping isPartial
-            out = {}
-            for k in keywords:
-                out[k] = float(df[k].mean())
+            out = {k: float(df[k].mean()) for k in keywords}
             avg = float(pd.Series(out).mean())
             return avg, out
 
         return await asyncio.to_thread(_work)
 
-    # Glassnode optional endpoints (require API key)
     async def glassnode_mvrv_z(self, asset: str = "BTC") -> Optional[float]:
-        # Daily metric; take the latest value
         api_key = CFG.glassnode.get("api_key") or ""
         if not api_key or not CFG.glassnode.get("enable"):
             return None
@@ -182,12 +155,11 @@ class DataClient:
             return float(data[-1]["v"])
         return None
 
-    async def glassnode_exchange_netflow(self, asset: str = "BTC") -> Optional[float]:
+    async def glassnode_exchange_inflow(self, asset: str = "BTC") -> Optional[float]:
         api_key = CFG.glassnode.get("api_key") or ""
         if not api_key or not CFG.glassnode.get("enable"):
             return None
         url = "https://api.glassnode.com/v1/metrics/transactions/transfers_volume_to_exchanges_adjusted_sum"
-        # Netflow is typically inflow - outflow; many endpoints exist. We use adjusted inflow as a rough proxy.
         data = await fetch_json(self.client, url, params={"a": asset, "api_key": api_key, "i": "24h"})
         if isinstance(data, list) and data:
             return float(data[-1]["v"])
@@ -197,9 +169,7 @@ class DataClient:
 # Metrics computation
 # -----------------------------
 
-
 async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
-    # Parallel fetches
     tasks = []
     tasks.append(dc.coingecko_global())
     tasks.append(dc.binance_price("ETHBTC"))
@@ -209,35 +179,26 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
         tasks.append(dc.binance_open_interest(sym))
     tasks.append(dc.google_trends_score(["crypto", "bitcoin", "ethereum"]))
     tasks.append(dc.glassnode_mvrv_z("BTC"))
-    tasks.append(dc.glassnode_exchange_netflow("BTC"))
+    tasks.append(dc.glassnode_exchange_inflow("BTC"))
 
     results = await asyncio.gather(*tasks)
 
-    # Unpack
     idx = 0
-    cg = results[idx]
-    idx += 1
-    ethbtc = results[idx]
-    idx += 1
+    cg = results[idx]; idx += 1
+    ethbtc = results[idx]; idx += 1
 
     funding = {}
     for sym in CFG.symbols["funding"]:
-        funding[sym] = results[idx]
-        idx += 1
+        funding[sym] = results[idx]; idx += 1
 
     oi = {}
     for sym in CFG.symbols["oi"]:
-        oi[sym] = results[idx]
-        idx += 1
+        oi[sym] = results[idx]; idx += 1
 
-    trends_avg, trends_by_kw = results[idx]
-    idx += 1
-    mvrv_z = results[idx]
-    idx += 1
-    exch_inflow = results[idx]
-    idx += 1
+    trends_avg, trends_by_kw = results[idx]; idx += 1
+    mvrv_z = results[idx]; idx += 1
+    exch_inflow = results[idx]; idx += 1
 
-    # CoinGecko global structure
     total_mcap = cg["data"]["total_market_cap"].get("usd", 0.0)
     btc_pct = cg["data"]["market_cap_percentage"].get("btc", 0.0)
     eth_pct = cg["data"]["market_cap_percentage"].get("eth", 0.0)
@@ -246,13 +207,10 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
     altcap = max(total_mcap - btc_mcap - eth_mcap, 0.0)
     altcap_btc_ratio = (altcap / btc_mcap) if btc_mcap > 0 else 0.0
 
-    # Compute OI notional USD using mark price (from premiumIndex) if needed; here we only have raw OI coin qty endpoint.
-    # For simplicity, we fetch BTC/ETH mark price from premiumIndex already in 'funding' dict.
     def _oi_usd(symbol: str) -> Optional[float]:
         try:
             raw = oi[symbol]
-            qty = float(raw.get("openInterest", 0.0))  # in base asset
-            # find mark price for that symbol from 'funding' dict (premiumIndex includes markPrice)
+            qty = float(raw.get("openInterest", 0.0))  # base asset qty
             prem = funding.get(symbol, {})
             mark = float(prem.get("markPrice", 0.0))
             return qty * mark
@@ -274,7 +232,6 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
         "exchange_inflow_proxy": exch_inflow,
     }
 
-
 def build_status_text(metrics: Dict[str, Any]) -> str:
     lines = []
     lines.append(f"📊 *Crypto Cycle Snapshot* (`{metrics['timestamp']}` UTC)")
@@ -282,13 +239,11 @@ def build_status_text(metrics: Dict[str, Any]) -> str:
     lines.append(f"• ETH/BTC: *{metrics['eth_btc']:.5f}*")
     lines.append(f"• Altcap/BTC: *{metrics['altcap_btc_ratio']:.2f}*")
 
-    # Funding
     lines.append("• Funding (8h, est):")
     for sym, d in metrics["funding"].items():
-        fr = float(d.get("lastFundingRate", 0.0)) * 100  # to %
+        fr = float(d.get("lastFundingRate", 0.0)) * 100
         lines.append(f"   - {sym}: *{fr:.3f}%*")
 
-    # OI
     lines.append("• Open Interest (USD est):")
     for sym, notional in metrics["open_interest_usd"].items():
         if notional is not None:
@@ -296,21 +251,17 @@ def build_status_text(metrics: Dict[str, Any]) -> str:
         else:
             lines.append(f"   - {sym}: n/a")
 
-    # Trends
     lines.append(f"• Google Trends 7d avg: *{metrics['google_trends_avg7d']:.1f}* " +
                  f"(crypto {metrics['google_trends_breakdown']['crypto']:.1f}, " +
                  f"bitcoin {metrics['google_trends_breakdown']['bitcoin']:.1f}, " +
                  f"ethereum {metrics['google_trends_breakdown']['ethereum']:.1f})")
 
     if metrics.get("mvrv_z") is not None:
-        lines.append(
-            f"• BTC MVRV Z-Score (Glassnode): *{metrics['mvrv_z']:.2f}*")
+        lines.append(f"• BTC MVRV Z-Score (Glassnode): *{metrics['mvrv_z']:.2f}*")
     if metrics.get("exchange_inflow_proxy") is not None:
-        lines.append(
-            f"• Exchange inflow proxy (Glassnode, adj sum): *{metrics['exchange_inflow_proxy']:.2f}*")
+        lines.append(f"• Exchange inflow proxy (Glassnode, adj sum): *{metrics['exchange_inflow_proxy']:.2f}*")
 
     return "\n".join(lines)
-
 
 def evaluate_flags(metrics: Dict[str, Any], thresholds: Dict[str, Any]) -> Tuple[int, List[str]]:
     t = thresholds
@@ -325,14 +276,12 @@ def evaluate_flags(metrics: Dict[str, Any], thresholds: Dict[str, Any]) -> Tuple
     if metrics["altcap_btc_ratio"] >= t["altcap_btc_ratio_max"]:
         flags.append("Altcap/BTC stretched")
 
-    # funding
     for sym, d in metrics["funding"].items():
-        fr = abs(float(d.get("lastFundingRate", 0.0)) * 100)  # %
+        fr = abs(float(d.get("lastFundingRate", 0.0)) * 100)
         if fr >= t["funding_rate_abs_max"]:
             flags.append(f"Funding extreme: {sym} ({fr:.3f}%)")
             break
 
-    # OI
     oi_usd = metrics["open_interest_usd"]
     btc_oi = oi_usd.get("BTCUSDT")
     eth_oi = oi_usd.get("ETHUSDT")
@@ -341,13 +290,12 @@ def evaluate_flags(metrics: Dict[str, Any], thresholds: Dict[str, Any]) -> Tuple
     if eth_oi and eth_oi >= t["open_interest_eth_usdt_usd_max"]:
         flags.append(f"ETH OI high (${eth_oi:,.0f})")
 
-    # Trends
     if metrics["google_trends_avg7d"] >= t["google_trends_7d_avg_min"]:
         flags.append("Retail interest (Google) high")
 
-    # Optional Glassnode
-    if metrics.get("mvrv_z") is not None and metrics["mvrv_z"] >= 7.0:
-        flags.append("MVRV Z-Score extreme")
+    if metrics.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None:
+        if metrics["mvrv_z"] >= t["mvrv_z_extreme"]:
+            flags.append("MVRV Z-Score extreme")
 
     return len(flags), flags
 
@@ -355,6 +303,49 @@ def evaluate_flags(metrics: Dict[str, Any], thresholds: Dict[str, Any]) -> Tuple
 # Telegram Bot
 # -----------------------------
 
+SUBSCRIBERS: set[int] = set()
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    SUBSCRIBERS.add(chat_id)
+    await update.message.reply_text(
+        "👋 Crypto Cycle Watch online.\n"
+        "Use /status for a snapshot, /subscribe to get alerts, "
+        "/settime HH:MM to set daily summary time, /unsubscribe to stop."
+    )
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    dc = DataClient()
+    try:
+        metrics = await gather_metrics(dc)
+        text = build_status_text(metrics)
+        if CFG.risk_profiles:
+            cur = CHAT_PROFILE.get(update.effective_chat.id, CFG.default_profile)
+            text += f"\n• Risk profile: *{cur}*"
+        t = get_thresholds_for_chat(update.effective_chat.id if update and update.effective_chat else None)
+        nflags, flags = evaluate_flags(metrics, t)
+        if nflags > 0:
+            text += "\n\n⚠️ Flags: " + ", ".join(flags)
+        await update.message.reply_markdown(text)
+    finally:
+        await dc.close()
+
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    SUBSCRIBERS.add(chat_id)
+    await update.message.reply_text("✅ Subscribed. You'll receive alerts and daily summaries here.")
+
+async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    SUBSCRIBERS.discard(chat_id)
+    await update.message.reply_text("🛑 Unsubscribed.")
+
+async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args[0]) != 5 or context.args[0][2] != ":":
+        await update.message.reply_text("Usage: /settime HH:MM (24h)")
+        return
+    CFG.schedule["daily_summary_time"] = context.args[0]
+    await update.message.reply_text(f"🕒 Daily summary time set to {context.args[0]} (server time).")
 
 async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -373,7 +364,6 @@ async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_profiles()
     await update.message.reply_text(f"✅ Risk profile set to *{choice}* for this chat.", parse_mode="Markdown")
 
-
 async def cmd_getrisk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not CFG.risk_profiles:
@@ -382,72 +372,12 @@ async def cmd_getrisk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = CHAT_PROFILE.get(chat_id, CFG.default_profile)
     await update.message.reply_text(f"Current risk profile for this chat: *{cur}*", parse_mode="Markdown")
 
-
-SUBSCRIBERS: set[int] = set()
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    SUBSCRIBERS.add(chat_id)
-    await update.message.reply_text(
-        "👋 Crypto Cycle Watch online.\n"
-        "Use /status for a snapshot, /subscribe to get alerts, "
-        "/settime HH:MM to set daily summary time, /unsubscribe to stop."
-    )
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dc = DataClient()
-    try:
-        metrics = await gather_metrics(dc)
-        text = build_status_text(metrics)
-        # annotate with profile
-        if CFG.risk_profiles:
-            cur = CHAT_PROFILE.get(
-                update.effective_chat.id, CFG.default_profile)
-            text += f"\n• Risk profile: *{cur}*"
-        t = get_thresholds_for_chat(update.effective_chat.id if 'update' in locals(
-        ) and update and update.effective_chat else None)
-        nflags, flags = evaluate_flags(metrics, t)
-        if nflags > 0:
-            text += "\n\n⚠️ Flags: " + ", ".join(flags)
-        await update.message.reply_markdown(text)
-    finally:
-        await dc.close()
-
-
-async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    SUBSCRIBERS.add(chat_id)
-    await update.message.reply_text("✅ Subscribed. You'll receive alerts and daily summaries here.")
-
-
-async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    SUBSCRIBERS.discard(chat_id)
-    await update.message.reply_text("🛑 Unsubscribed.")
-
-
-async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or len(context.args[0]) != 5 or context.args[0][2] != ":":
-        await update.message.reply_text("Usage: /settime HH:MM (24h)")
-        return
-    CFG.schedule["daily_summary_time"] = context.args[0]
-    await update.message.reply_text(f"🕒 Daily summary time set to {context.args[0]} (server time).")
-
-
 async def push_summary(app: Application):
     dc = DataClient()
     try:
         metrics = await gather_metrics(dc)
         text = build_status_text(metrics)
-        # annotate with profile
-        if CFG.risk_profiles:
-            cur = CHAT_PROFILE.get(
-                update.effective_chat.id, CFG.default_profile)
-            text += f"\n• Risk profile: *{cur}*"
-        t = get_thresholds_for_chat(update.effective_chat.id if 'update' in locals(
-        ) and update and update.effective_chat else None)
+        t = get_thresholds_for_chat(None)
         nflags, flags = evaluate_flags(metrics, t)
         if nflags > 0:
             text += "\n\n⚠️ Flags: " + ", ".join(flags)
@@ -465,18 +395,14 @@ async def push_summary(app: Application):
     finally:
         await dc.close()
 
-
 async def push_alerts(app: Application):
     dc = DataClient()
     try:
         metrics = await gather_metrics(dc)
-        t = get_thresholds_for_chat(update.effective_chat.id if 'update' in locals(
-        ) and update and update.effective_chat else None)
+        t = get_thresholds_for_chat(None)
         nflags, flags = evaluate_flags(metrics, t)
-        if nflags >= CFG.thresholds["min_flags_for_alert"]:
-            text = "🚨 *Top Risk Alert*\n" + \
-                build_status_text(metrics) + \
-                "\n\n⚠️ Flags: " + ", ".join(flags)
+        if nflags >= t.get("min_flags_for_alert", 3):
+            text = "🚨 *Top Risk Alert*\n" + build_status_text(metrics) + "\n\n⚠️ Flags: " + ", ".join(flags)
             targets = set(SUBSCRIBERS)
             if CFG.force_chat_id:
                 try:
@@ -491,11 +417,9 @@ async def push_alerts(app: Application):
     finally:
         await dc.close()
 
-
 def parse_hhmm(hhmm: str) -> Tuple[int, int]:
     hh, mm = hhmm.split(":")
     return int(hh), int(mm)
-
 
 async def main():
     token = CFG.telegram["token"]
@@ -503,17 +427,17 @@ async def main():
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("risk", cmd_risk))
-    app.add_handler(CommandHandler("getrisk", cmd_getrisk))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     app.add_handler(CommandHandler("settime", cmd_settime))
+    app.add_handler(CommandHandler("risk", cmd_risk))
+    app.add_handler(CommandHandler("getrisk", cmd_getrisk))
 
     # Load saved chat profiles
     load_profiles()
 
-    # Scheduler
+    # Scheduler (use IANA TZ from env; default UTC)
     tzname = os.getenv("TZ", "UTC")
     scheduler = AsyncIOScheduler(timezone=tzname)
     # Daily summary
@@ -525,7 +449,7 @@ async def main():
                       CronTrigger(minute="*/15"))
     scheduler.start()
 
-    # Warm-up: announce if force_chat_id is set
+    # Optional startup ping
     if CFG.force_chat_id:
         try:
             await app.bot.send_message(chat_id=int(CFG.force_chat_id),
@@ -534,7 +458,16 @@ async def main():
             log.warning("Unable to notify force_chat_id: %s", e)
 
     log.info("Bot running. Press Ctrl+C to exit.")
-    await app.run_polling(close_loop=False)
+
+    # Start PTB without taking over the loop
+    await app.initialize()
+    await app.start()
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await app.stop()
+        await app.shutdown()
 
 if __name__ == "__main__":
     try:
