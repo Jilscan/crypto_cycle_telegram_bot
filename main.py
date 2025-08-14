@@ -327,6 +327,34 @@ class DataClient:
             return None
         return total if total > 0 else None
 
+        # Google Trends (runs in a thread to avoid blocking)
+    async def google_trends_score(self, keywords: List[str]) -> Tuple[float, Dict[str, float]]:
+        """
+        Returns (7d average across keywords, per-keyword averages).
+        Falls back to zeros if pytrends/pandas is unavailable or errors out.
+        """
+        async def _run():
+            try:
+                from pytrends.request import TrendReq  # type: ignore
+                import pandas as pd  # type: ignore
+
+                py = TrendReq(hl="en-US", tz=0)
+                py.build_payload(kw_list=keywords, timeframe="now 7-d", geo="")
+                df = py.interest_over_time()
+                if df is None or df.empty:
+                    return 0.0, {k: 0.0 for k in keywords}
+                means = {k: float(pd.to_numeric(
+                    df[k], errors="coerce").mean()) for k in keywords}
+                avg = sum(means.values()) / max(len(means), 1)
+                return float(avg), {k: float(v) for k, v in means.items()}
+            except Exception as e:
+                log.warning("pytrends failed: %s", e)
+                return 0.0, {k: 0.0 for k in keywords}
+
+        # run the blocking pytrends fetch in a worker thread
+        return await asyncio.to_thread(lambda: asyncio.run(_run()))
+
+
 # ───────────────────────────
 # Metrics (resilient)
 # ───────────────────────────
