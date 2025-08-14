@@ -29,11 +29,12 @@ DEFAULTS: Dict[str, Any] = {
         "btc_dominance_max": 60.0,
         "eth_btc_ratio_max": 0.09,
         "altcap_btc_ratio_max": 1.8,
-        "funding_rate_abs_max": 0.10,  # percent
+        "funding_rate_abs_max": 0.10,  # percent per 8h
         "open_interest_btc_usdt_usd_max": 20_000_000_000,
         "open_interest_eth_usdt_usd_max": 8_000_000_000,
         "google_trends_7d_avg_min": 75,
         "mvrv_z_extreme": 7.0,
+        "fear_greed_greed_min": 70,  # new: Greed threshold (0-100)
     },
     "glassnode": {"api_key": "", "enable": False},
     "force_chat_id": "",
@@ -41,23 +42,41 @@ DEFAULTS: Dict[str, Any] = {
     "default_profile": "moderate",
     "risk_profiles": {
         "conservative": {"thresholds": {
-            "min_flags_for_alert": 2, "btc_dominance_max": 57.0, "eth_btc_ratio_max": 0.085,
-            "altcap_btc_ratio_max": 1.6, "funding_rate_abs_max": 0.06,
+            "min_flags_for_alert": 2,
+            "btc_dominance_max": 57.0,
+            "eth_btc_ratio_max": 0.085,
+            "altcap_btc_ratio_max": 1.6,
+            "funding_rate_abs_max": 0.06,
             "open_interest_btc_usdt_usd_max": 15_000_000_000,
-            "open_interest_eth_usdt_usd_max": 6_000_000_000, "google_trends_7d_avg_min": 60,
-            "mvrv_z_extreme": 6.5}},
+            "open_interest_eth_usdt_usd_max": 6_000_000_000,
+            "google_trends_7d_avg_min": 60,
+            "mvrv_z_extreme": 6.5,
+            "fear_greed_greed_min": 60
+        }},
         "moderate": {"thresholds": {
-            "min_flags_for_alert": 3, "btc_dominance_max": 60.0, "eth_btc_ratio_max": 0.09,
-            "altcap_btc_ratio_max": 1.8, "funding_rate_abs_max": 0.10,
+            "min_flags_for_alert": 3,
+            "btc_dominance_max": 60.0,
+            "eth_btc_ratio_max": 0.09,
+            "altcap_btc_ratio_max": 1.8,
+            "funding_rate_abs_max": 0.10,
             "open_interest_btc_usdt_usd_max": 20_000_000_000,
-            "open_interest_eth_usdt_usd_max": 8_000_000_000, "google_trends_7d_avg_min": 75,
-            "mvrv_z_extreme": 7.0}},
+            "open_interest_eth_usdt_usd_max": 8_000_000_000,
+            "google_trends_7d_avg_min": 75,
+            "mvrv_z_extreme": 7.0,
+            "fear_greed_greed_min": 70
+        }},
         "aggressive": {"thresholds": {
-            "min_flags_for_alert": 4, "btc_dominance_max": 62.0, "eth_btc_ratio_max": 0.095,
-            "altcap_btc_ratio_max": 2.0, "funding_rate_abs_max": 0.14,
+            "min_flags_for_alert": 4,
+            "btc_dominance_max": 62.0,
+            "eth_btc_ratio_max": 0.095,
+            "altcap_btc_ratio_max": 2.0,
+            "funding_rate_abs_max": 0.14,
             "open_interest_btc_usdt_usd_max": 25_000_000_000,
-            "open_interest_eth_usdt_usd_max": 10_000_000_000, "google_trends_7d_avg_min": 85,
-            "mvrv_z_extreme": 8.0}},
+            "open_interest_eth_usdt_usd_max": 10_000_000_000,
+            "google_trends_7d_avg_min": 85,
+            "mvrv_z_extreme": 8.0,
+            "fear_greed_greed_min": 80
+        }},
     },
 }
 
@@ -141,7 +160,7 @@ def get_thresholds_for_chat(chat_id: Optional[int]) -> Dict[str, Any]:
 
 
 OKX_BASE = "https://www.okx.com"
-HEADERS = {"User-Agent": "crypto-cycle-bot/1.1", "Accept": "application/json"}
+HEADERS = {"User-Agent": "crypto-cycle-bot/1.2", "Accept": "application/json"}
 
 
 def to_okx_instId(sym: str) -> str:
@@ -201,7 +220,7 @@ class DataClient:
         btc_usd = float(data["bitcoin"]["usd"])
         return eth_usd / btc_usd
 
-    # ── OKX v5 public endpoints (no API key needed) ─────────────────────────
+    # OKX v5 public endpoints (no API key needed)
     async def okx_ticker_last_price(self, instId: str) -> Optional[float]:
         data = await fetch_json(self.client, f"{OKX_BASE}/api/v5/market/ticker", {"instId": instId})
         try:
@@ -213,25 +232,36 @@ class DataClient:
         return None
 
     async def okx_funding_rate(self, instId: str) -> Optional[float]:
-        # current period funding rate
         data = await fetch_json(self.client, f"{OKX_BASE}/api/v5/public/funding-rate", {"instId": instId})
         try:
             lst = data.get("data", [])
             if lst:
-                # decimal, e.g., 0.001 = 0.1%
+                # decimal; 0.001 == 0.1% per 8h
                 return float(lst[0]["fundingRate"])
         except Exception:
             pass
         return None
 
     async def okx_open_interest_usd(self, instId: str) -> Optional[float]:
-        data = await fetch_json(self.client, f"{OKX_BASE}/api/v5/public/open-interest", {"instId": instId})
+        # include instType; prefer oiUsd; fallback to oiCcy * last price
+        data = await fetch_json(
+            self.client,
+            f"{OKX_BASE}/api/v5/public/open-interest",
+            {"instType": "SWAP", "instId": instId}
+        )
         try:
             lst = data.get("data", [])
-            if lst:
-                oi_usd = lst[0].get("oiUsd")
-                if oi_usd is not None:
-                    return float(oi_usd)
+            if not lst:
+                return None
+            row = lst[0]
+            val = row.get("oiUsd")
+            if val not in (None, "", "0"):
+                return float(val)
+            oi_ccy = row.get("oiCcy")
+            if oi_ccy not in (None, ""):
+                last = await _safe(self.okx_ticker_last_price(instId), None, f"lastPrice {instId}")
+                if last:
+                    return float(oi_ccy) * float(last)
         except Exception:
             pass
         return None
@@ -253,6 +283,15 @@ class DataClient:
             return avg, means
 
         return await asyncio.to_thread(_fetch)
+
+    # Fear & Greed (alternative.me)
+    async def fear_greed(self) -> Tuple[Optional[int], Optional[str]]:
+        data = await fetch_json(self.client, "https://api.alternative.me/fng/", {"limit": 1})
+        try:
+            row = data.get("data", [])[0]
+            return int(row["value"]), str(row["value_classification"])
+        except Exception:
+            return None, None
 
     # Optional: Glassnode (requires key + enable=true)
     async def glassnode_mvrv_z(self, asset: str = "BTC") -> Optional[float]:
@@ -316,12 +355,13 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
     altcap = max(total_mcap - btc_mcap - eth_mcap, 0.0)
     altcap_btc_ratio = (altcap / btc_mcap) if btc_mcap > 0 else 0.0
 
-    # Google Trends + optional on-chain
+    # Google Trends + optional on-chain + fear & greed
     trends_avg, trends_by_kw = await _safe(
         dc.google_trends_score(["crypto", "bitcoin", "ethereum"]),
         (0.0, {"crypto": 0.0, "bitcoin": 0.0, "ethereum": 0.0}),
         "google_trends_score"
     )
+    fng_value, fng_label = await _safe(dc.fear_greed(), (None, None), "fear_greed")
     mvrv_z = await _safe(dc.glassnode_mvrv_z("BTC"), None, "glassnode_mvrv_z")
     exch_inflow = await _safe(dc.glassnode_exchange_inflow("BTC"), None, "glassnode_exchange_inflow")
 
@@ -334,66 +374,151 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
         "open_interest_usd": oi_usd,
         "google_trends_avg7d": float(trends_avg or 0.0),
         "google_trends_breakdown": trends_by_kw or {"crypto": 0.0, "bitcoin": 0.0, "ethereum": 0.0},
+        "fear_greed_index": fng_value,
+        "fear_greed_label": fng_label,
         "mvrv_z": mvrv_z,
         "exchange_inflow_proxy": exch_inflow,
     }
 
+# ───────────────────────────
+# Presentation helpers (HTML)
+# ───────────────────────────
 
-def build_status_text(m: Dict[str, Any]) -> str:
-    lines = [
-        f"📊 *Crypto Cycle Snapshot* (`{m['timestamp']}` UTC)",
-        f"• BTC Dominance: *{m['btc_dominance_pct']:.2f}%*",
-        f"• ETH/BTC: *{m['eth_btc']:.5f}*",
-        f"• Altcap/BTC: *{m['altcap_btc_ratio']:.2f}*",
-        "• Funding (8h, est):",
-    ]
-    for sym, d in m["funding"].items():
-        fr_pct = float(d.get("lastFundingRate", 0.0)) * 100.0
-        lines.append(f"   - {sym}: *{fr_pct:.3f}%*")
-    lines.append("• Open Interest (USD est):")
-    for sym, notional in m["open_interest_usd"].items():
+
+def bullet(flagged: bool) -> str:
+    return "🔴" if flagged else "🟢"
+
+
+def b(txt: str) -> str:
+    return f"<b>{txt}</b>"
+
+
+def fmt_usd(x: Optional[float]) -> str:
+    return "n/a" if x is None else f"${x:,.0f}"
+
+
+def build_status_text(m: Dict[str, Any], t: Dict[str, Any] | None = None) -> str:
+    """Human-friendly snapshot with colored bullets on metric values."""
+    t = t or CFG.thresholds
+
+    # Flags (for coloring)
+    flags_count, flags_list = evaluate_flags(m, t)
+
+    # Per-metric local flag checks
+    dom = m["btc_dominance_pct"]
+    f_dom = dom >= t["btc_dominance_max"]
+    ethbtc = m["eth_btc"]
+    f_ethbtc = ethbtc >= t["eth_btc_ratio_max"]
+    altbtc = m["altcap_btc_ratio"]
+    f_altbtc = altbtc >= t["altcap_btc_ratio_max"]
+
+    # funding (max abs)
+    funding = m["funding"]
+    max_fr = 0.0
+    max_sym = None
+    for sym, d in funding.items():
+        fr_pct = abs(float(d.get("lastFundingRate", 0.0)) * 100.0)
+        if fr_pct > max_fr:
+            max_fr, max_sym = fr_pct, sym
+    f_fund = max_fr >= t["funding_rate_abs_max"]
+
+    # open interest
+    oi = m["open_interest_usd"]
+    btc_oi = oi.get("BTCUSDT")
+    eth_oi = oi.get("ETHUSDT")
+    f_btc_oi = bool(btc_oi and btc_oi >= t["open_interest_btc_usdt_usd_max"])
+    f_eth_oi = bool(eth_oi and eth_oi >= t["open_interest_eth_usdt_usd_max"])
+
+    # Google Trends
+    gavg = m["google_trends_avg7d"]
+    f_trends = gavg >= t["google_trends_7d_avg_min"]
+
+    # Fear & Greed
+    fng_val = m.get("fear_greed_index")
+    fng_lab = m.get("fear_greed_label")
+    f_fng = bool(fng_val is not None and fng_val >=
+                 t.get("fear_greed_greed_min", 70))
+
+    lines: List[str] = []
+    lines.append(f"📊 {b('Crypto Market Snapshot')} ({m['timestamp']} UTC)")
+
+    lines.append(f"• Bitcoin market share of total crypto market: "
+                 f"{bullet(f_dom)} {b(f'{dom:.2f}%')}  (flag ≥ {t['btc_dominance_max']:.2f}%)")
+
+    lines.append(f"• Ether price relative to Bitcoin (ETH/BTC): "
+                 f"{bullet(f_ethbtc)} {b(f'{ethbtc:.5f}')}  (flag ≥ {t['eth_btc_ratio_max']:.5f})")
+
+    lines.append(f"• Altcoin market cap / Bitcoin market cap: "
+                 f"{bullet(f_altbtc)} {b(f'{altbtc:.2f}')}  (flag ≥ {t['altcap_btc_ratio_max']:.2f})")
+
+    if max_sym:
+        lines.append(f"• Perpetual funding rate (max absolute across watched pairs): "
+                     f"{bullet(f_fund)} {b(f'{max_fr:.3f}%')} on {max_sym}  "
+                     f"(flag ≥ {t['funding_rate_abs_max']:.3f}%)")
+    else:
+        lines.append(f"• Perpetual funding rate: {bullet(False)} {b('n/a')}")
+
+    lines.append(f"• Bitcoin open interest (USD, estimate): "
+                 f"{bullet(f_btc_oi)} {b(fmt_usd(btc_oi))}  "
+                 f"(flag ≥ {fmt_usd(t['open_interest_btc_usdt_usd_max'])})")
+
+    lines.append(f"• Ether open interest (USD, estimate): "
+                 f"{bullet(f_eth_oi)} {b(fmt_usd(eth_oi))}  "
+                 f"(flag ≥ {fmt_usd(t['open_interest_eth_usdt_usd_max'])})")
+
+    lines.append(f"• Google Trends (7-day average; crypto/bitcoin/ethereum): "
+                 f"{bullet(f_trends)} {b(f'{gavg:.1f}')}  "
+                 f"(flag ≥ {t['google_trends_7d_avg_min']:.1f})")
+
+    if fng_val is not None:
+        lines.append(f"• Fear & Greed Index (overall crypto): "
+                     f"{bullet(f_fng)} {b(str(fng_val))} ({fng_lab or 'n/a'})  "
+                     f"(flag ≥ {t.get('fear_greed_greed_min', 70)})")
+
+    if m.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None:
+        f_mz = m["mvrv_z"] >= t["mvrv_z_extreme"]
+        lines.append(f"• Bitcoin MVRV Z-Score (on-chain valuation): "
+                     f"{bullet(f_mz)} {b(f'{m['mvrv_z']:.2f}')}  "
+                     f"(flag ≥ {t['mvrv_z_extreme']:.2f})")
+
+    if flags_count > 0:
+        lines.append("")
         lines.append(
-            f"   - {sym}: *${notional:,.0f}*" if notional is not None else f"   - {sym}: n/a")
-    lines.append(
-        f"• Google Trends 7d avg: *{m['google_trends_avg7d']:.1f}* "
-        f"(crypto {m['google_trends_breakdown']['crypto']:.1f}, "
-        f"bitcoin {m['google_trends_breakdown']['bitcoin']:.1f}, "
-        f"ethereum {m['google_trends_breakdown']['ethereum']:.1f})"
-    )
-    if m.get("mvrv_z") is not None:
-        lines.append(f"• BTC MVRV Z-Score (Glassnode): *{m['mvrv_z']:.2f}*")
-    if m.get("exchange_inflow_proxy") is not None:
-        lines.append(
-            f"• Exchange inflow proxy (Glassnode, adj sum): *{m['exchange_inflow_proxy']:.2f}*")
+            f"⚠️ {b(f'Triggered flags ({flags_count})')}: " + ", ".join(flags_list))
+
     return "\n".join(lines)
 
 
 def evaluate_flags(m: Dict[str, Any], t: Dict[str, Any]) -> Tuple[int, List[str]]:
     flags: List[str] = []
     if m["btc_dominance_pct"] >= t["btc_dominance_max"]:
-        flags.append("BTC dominance high")
+        flags.append("High Bitcoin dominance")
     if m["eth_btc"] >= t["eth_btc_ratio_max"]:
-        flags.append("ETH/BTC elevated")
+        flags.append("Elevated ETH/BTC ratio")
     if m["altcap_btc_ratio"] >= t["altcap_btc_ratio_max"]:
-        flags.append("Altcap/BTC stretched")
+        flags.append("Alt market cap stretched vs BTC")
     # funding (max abs)
     for sym, d in m["funding"].items():
         fr_pct = abs(float(d.get("lastFundingRate", 0.0)) * 100.0)
         if fr_pct >= t["funding_rate_abs_max"]:
-            flags.append(f"Funding extreme: {sym} ({fr_pct:.3f}%)")
+            flags.append(f"Perpetual funding extreme on {sym} ({fr_pct:.3f}%)")
             break
     # open interest notional USD (if available)
     oi = m["open_interest_usd"]
     if oi.get("BTCUSDT") and oi["BTCUSDT"] >= t["open_interest_btc_usdt_usd_max"]:
-        flags.append(f"BTC OI high (${oi['BTCUSDT']:,.0f})")
+        flags.append(f"High Bitcoin open interest (${oi['BTCUSDT']:,.0f})")
     if oi.get("ETHUSDT") and oi["ETHUSDT"] >= t["open_interest_eth_usdt_usd_max"]:
-        flags.append(f"ETH OI high (${oi['ETHUSDT']:,.0f})")
+        flags.append(f"High Ether open interest (${oi['ETHUSDT']:,.0f})")
     # google trends
     if m["google_trends_avg7d"] >= t["google_trends_7d_avg_min"]:
-        flags.append("Retail interest (Google) high")
+        flags.append("Elevated retail interest (Google Trends)")
+    # fear & greed
+    fg = m.get("fear_greed_index")
+    if fg is not None and fg >= t.get("fear_greed_greed_min", 70):
+        flags.append("Greed is elevated (Fear & Greed Index)")
     # on-chain optional
     if m.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None and m["mvrv_z"] >= t["mvrv_z_extreme"]:
-        flags.append("MVRV Z-Score extreme")
+        flags.append("On-chain overvaluation (MVRV Z-Score)")
     return len(flags), flags
 
 # ───────────────────────────
@@ -409,7 +534,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Crypto Cycle Watch online.\n"
         "Commands: /status, /assess, /assess_json, /subscribe, /unsubscribe, "
-        "/risk <conservative|moderate|aggressive>, /getrisk, /settime HH:MM."
+        "/risk <conservative|moderate|aggressive>, /getrisk, /settime HH:MM.",
+        parse_mode="HTML"
     )
 
 
@@ -417,61 +543,58 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dc = DataClient()
     try:
         m = await gather_metrics(dc)
-        text = build_status_text(m)
+        t = get_thresholds_for_chat(update.effective_chat.id)
+        text = build_status_text(m, t)
         if CFG.risk_profiles:
             cur = CHAT_PROFILE.get(
                 update.effective_chat.id, CFG.default_profile)
-            text += f"\n• Risk profile: *{cur}*"
-        t = get_thresholds_for_chat(update.effective_chat.id)
-        n, flags = evaluate_flags(m, t)
-        if n > 0:
-            text += "\n\n⚠️ Flags: " + ", ".join(flags)
-        await update.message.reply_markdown(text)
+            text += f"\n• Active risk profile: {b(cur)}"
+        await update.message.reply_text(text, parse_mode="HTML")
     finally:
         await dc.close()
 
 
 async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUBSCRIBERS.add(update.effective_chat.id)
-    await update.message.reply_text("✅ Subscribed. You'll receive alerts and daily summaries here.")
+    await update.message.reply_text("✅ Subscribed. You'll receive alerts and daily summaries here.", parse_mode="HTML")
 
 
 async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUBSCRIBERS.discard(update.effective_chat.id)
-    await update.message.reply_text("🛑 Unsubscribed.")
+    await update.message.reply_text("🛑 Unsubscribed.", parse_mode="HTML")
 
 
 async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args[0]) != 5 or context.args[0][2] != ":":
-        await update.message.reply_text("Usage: /settime HH:MM (24h)")
+        await update.message.reply_text("Usage: /settime HH:MM (24h)", parse_mode="HTML")
         return
     CFG.schedule["daily_summary_time"] = context.args[0]
-    await update.message.reply_text(f"🕒 Daily summary time set to {context.args[0]} (server time).")
+    await update.message.reply_text(f"🕒 Daily summary time set to {b(context.args[0])} (server time).", parse_mode="HTML")
 
 
 async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not CFG.risk_profiles:
-        await update.message.reply_text("Risk profiles not configured; using static thresholds.")
+        await update.message.reply_text("Risk profiles not configured; using static thresholds.", parse_mode="HTML")
         return
     if not context.args:
-        await update.message.reply_text("Usage: /risk <conservative|moderate|aggressive>")
+        await update.message.reply_text("Usage: /risk <conservative|moderate|aggressive>", parse_mode="HTML")
         return
     choice = context.args[0].lower()
     if choice not in CFG.risk_profiles:
-        await update.message.reply_text(f"Unknown profile '{choice}'. Options: {', '.join(CFG.risk_profiles.keys())}")
+        await update.message.reply_text(f"Unknown profile '{choice}'. Options: {', '.join(CFG.risk_profiles.keys())}", parse_mode="HTML")
         return
     CHAT_PROFILE[update.effective_chat.id] = choice
     save_profiles()
-    await update.message.reply_text(f"✅ Risk profile set to *{choice}*.", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Risk profile set to {b(choice)}.", parse_mode="HTML")
 
 
 async def cmd_getrisk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = CHAT_PROFILE.get(update.effective_chat.id, CFG.default_profile)
-    await update.message.reply_text(f"Current risk profile: *{cur}*", parse_mode="Markdown")
+    await update.message.reply_text(f"Current risk profile: {b(cur)}", parse_mode="HTML")
 
 
 async def cmd_assess(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show a full, per-metric assessment vs thresholds for this chat's profile."""
+    """Full, per-metric assessment vs thresholds for this chat's profile."""
     chat_id = update.effective_chat.id if update and update.effective_chat else None
     dc = DataClient()
     try:
@@ -479,7 +602,8 @@ async def cmd_assess(update: Update, context: ContextTypes.DEFAULT_TYPE):
             m = await gather_metrics(dc)
         except Exception as e:
             await update.message.reply_text(
-                f"⚠️ Could not fetch metrics right now: {e}\nTry again in a minute."
+                f"⚠️ Could not fetch metrics right now: {e}\nTry again in a minute.",
+                parse_mode="HTML"
             )
             return
 
@@ -487,79 +611,16 @@ async def cmd_assess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         profile = (CHAT_PROFILE.get(chat_id, CFG.default_profile)
                    if CFG.risk_profiles else "static")
 
-        def flag_mark(is_flag: bool) -> str:
-            return "🚨" if is_flag else "✅"
-
-        lines = []
-        lines.append(
-            f"🧪 *Current Assessment* (`{m.get('timestamp','n/a')}` UTC)")
-        lines.append(f"• Profile: *{profile}*")
-        lines.append("")
-
-        dom = float(m.get("btc_dominance_pct") or 0.0)
-        f_dom = dom >= float(t["btc_dominance_max"])
-        lines.append(
-            f"{flag_mark(f_dom)} BTC dominance: *{dom:.2f}%*  (flag ≥ {t['btc_dominance_max']:.2f}%)")
-
-        ethbtc = float(m.get("eth_btc") or 0.0)
-        f_ethbtc = ethbtc >= float(t["eth_btc_ratio_max"])
-        lines.append(
-            f"{flag_mark(f_ethbtc)} ETH/BTC: *{ethbtc:.5f}*  (flag ≥ {t['eth_btc_ratio_max']:.5f})")
-
-        altbtc = float(m.get("altcap_btc_ratio") or 0.0)
-        f_altbtc = altbtc >= float(t["altcap_btc_ratio_max"])
-        lines.append(
-            f"{flag_mark(f_altbtc)} Altcap/BTC: *{altbtc:.2f}*  (flag ≥ {t['altcap_btc_ratio_max']:.2f})")
-
-        funding = m.get("funding") or {}
-        max_fr = None
-        max_sym = None
-        for sym, d in funding.items():
-            fr_pct = abs(float(d.get("lastFundingRate") or 0.0) * 100.0)
-            if max_fr is None or fr_pct > max_fr:
-                max_fr, max_sym = fr_pct, sym
-        f_fund = (max_fr or 0.0) >= float(t["funding_rate_abs_max"])
-        if max_sym:
-            lines.append(
-                f"{flag_mark(f_fund)} Funding (max |8h|): *{max_fr:.3f}%* on *{max_sym}*  (flag ≥ {t['funding_rate_abs_max']:.3f}%)")
-        else:
-            lines.append("✅ Funding: n/a")
-
-        oi = m.get("open_interest_usd") or {}
-        btc_oi = oi.get("BTCUSDT")
-        eth_oi = oi.get("ETHUSDT")
-        f_btc_oi = bool(btc_oi and btc_oi >= float(
-            t["open_interest_btc_usdt_usd_max"]))
-        f_eth_oi = bool(eth_oi and eth_oi >= float(
-            t["open_interest_eth_usdt_usd_max"]))
-        lines.append(
-            f"{flag_mark(f_btc_oi)} BTC OI est: *${(btc_oi or 0):,.0f}*  (flag ≥ ${t['open_interest_btc_usdt_usd_max']:,.0f})")
-        lines.append(
-            f"{flag_mark(f_eth_oi)} ETH OI est: *${(eth_oi or 0):,.0f}*  (flag ≥ ${t['open_interest_eth_usdt_usd_max']:,.0f})")
-
-        gavg = float(m.get("google_trends_avg7d") or 0.0)
-        f_trends = gavg >= float(t["google_trends_7d_avg_min"])
-        lines.append(
-            f"{flag_mark(f_trends)} Google Trends 7d avg: *{gavg:.1f}*  (flag ≥ {t['google_trends_7d_avg_min']:.1f})")
-
-        if m.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None:
-            mz = float(m.get("mvrv_z") or 0.0)
-            f_mz = mz >= float(t["mvrv_z_extreme"])
-            lines.append(
-                f"{flag_mark(f_mz)} BTC MVRV Z-Score: *{mz:.2f}*  (flag ≥ {t['mvrv_z_extreme']:.2f})")
-
-        try:
-            nflags, flags = evaluate_flags(m, t)
-        except Exception:
-            nflags, flags = 0, []
-        lines.append("")
+        # Build the same pretty block plus explicit flags at the end
+        text = build_status_text(m, t)
+        nflags, flags = evaluate_flags(m, t)
+        lines = [text, "", f"• Active risk profile: {b(profile)}"]
         if nflags > 0:
             lines.append(
-                f"⚠️ *Triggered flags ({nflags}):* " + ", ".join(flags))
+                f"⚠️ {b(f'Triggered flags ({nflags})')}: " + ", ".join(flags))
         else:
-            lines.append("✅ *No flags* at current thresholds.")
-
-        await update.message.reply_markdown("\n".join(lines))
+            lines.append("✅ No flags at current thresholds.")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
     finally:
         await dc.close()
 
@@ -656,14 +717,15 @@ async def push_summary(app: Application):
     dc = DataClient()
     try:
         m = await gather_metrics(dc)
-        text = build_status_text(m)
         t = get_thresholds_for_chat(None)
+        text = build_status_text(m, t)
         n, flags = evaluate_flags(m, t)
         if n > 0:
-            text += "\n\n⚠️ Flags: " + ", ".join(flags)
+            text += "\n\n" + \
+                f"⚠️ {b(f'Triggered flags ({n})')}: " + ", ".join(flags)
         for chat_id in set(SUBSCRIBERS):
             try:
-                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
             except Exception as e:
                 log.warning("Failed to send summary to %s: %s", chat_id, e)
     finally:
@@ -677,11 +739,11 @@ async def push_alerts(app: Application):
         t = get_thresholds_for_chat(None)
         n, flags = evaluate_flags(m, t)
         if n >= t.get("min_flags_for_alert", 3):
-            text = "🚨 *Top Risk Alert*\n" + \
-                build_status_text(m) + "\n\n⚠️ Flags: " + ", ".join(flags)
+            text = "🚨 " + b("Top Risk Alert") + "\n" + build_status_text(m, t) + "\n\n" + \
+                   f"⚠️ {b(f'Triggered flags ({n})')}: " + ", ".join(flags)
             for chat_id in set(SUBSCRIBERS):
                 try:
-                    await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                    await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
                 except Exception as e:
                     log.warning("Failed to send alert to %s: %s", chat_id, e)
     finally:
@@ -730,7 +792,7 @@ async def main():
 
     if CFG.force_chat_id:
         try:
-            await app.bot.send_message(chat_id=int(CFG.force_chat_id), text="🤖 Crypto Cycle Watch bot started.")
+            await app.bot.send_message(chat_id=int(CFG.force_chat_id), text="🤖 Crypto Cycle Watch bot started.", parse_mode="HTML")
         except Exception as e:
             log.warning("Unable to notify force_chat_id: %s", e)
 
