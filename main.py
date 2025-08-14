@@ -34,7 +34,9 @@ DEFAULTS: Dict[str, Any] = {
         "open_interest_eth_usdt_usd_max": 8_000_000_000,
         "google_trends_7d_avg_min": 75,
         "mvrv_z_extreme": 7.0,
-        "fear_greed_greed_min": 70,  # new: Greed threshold (0-100)
+        "fear_greed_greed_min": 70,        # Greed threshold (0-100)
+        # 111DMA / (2*350DMA) ratio at/above which we flag
+        "pi_cycle_ratio_min": 0.98,
     },
     "glassnode": {"api_key": "", "enable": False},
     "force_chat_id": "",
@@ -51,7 +53,8 @@ DEFAULTS: Dict[str, Any] = {
             "open_interest_eth_usdt_usd_max": 6_000_000_000,
             "google_trends_7d_avg_min": 60,
             "mvrv_z_extreme": 6.5,
-            "fear_greed_greed_min": 60
+            "fear_greed_greed_min": 60,
+            "pi_cycle_ratio_min": 0.96,
         }},
         "moderate": {"thresholds": {
             "min_flags_for_alert": 3,
@@ -63,7 +66,8 @@ DEFAULTS: Dict[str, Any] = {
             "open_interest_eth_usdt_usd_max": 8_000_000_000,
             "google_trends_7d_avg_min": 75,
             "mvrv_z_extreme": 7.0,
-            "fear_greed_greed_min": 70
+            "fear_greed_greed_min": 70,
+            "pi_cycle_ratio_min": 0.98,
         }},
         "aggressive": {"thresholds": {
             "min_flags_for_alert": 4,
@@ -75,7 +79,8 @@ DEFAULTS: Dict[str, Any] = {
             "open_interest_eth_usdt_usd_max": 10_000_000_000,
             "google_trends_7d_avg_min": 85,
             "mvrv_z_extreme": 8.0,
-            "fear_greed_greed_min": 80
+            "fear_greed_greed_min": 80,
+            "pi_cycle_ratio_min": 1.00,
         }},
     },
 }
@@ -160,7 +165,7 @@ def get_thresholds_for_chat(chat_id: Optional[int]) -> Dict[str, Any]:
 
 
 OKX_BASE = "https://www.okx.com"
-HEADERS = {"User-Agent": "crypto-cycle-bot/1.2", "Accept": "application/json"}
+HEADERS = {"User-Agent": "crypto-cycle-bot/1.3", "Accept": "application/json"}
 
 
 def to_okx_instId(sym: str) -> str:
@@ -219,6 +224,16 @@ class DataClient:
         eth_usd = float(data["ethereum"]["usd"])
         btc_usd = float(data["bitcoin"]["usd"])
         return eth_usd / btc_usd
+
+    # BTC daily closes for Pi Cycle (CoinGecko)
+    async def coingecko_btc_daily(self, days: int = 500) -> List[float]:
+        data = await fetch_json(
+            self.client,
+            "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+            {"vs_currency": "usd", "days": days, "interval": "daily"},
+        )
+        prices = data.get("prices", [])  # list[[ms, price], ...]
+        return [float(p[1]) for p in prices]
 
     # OKX v5 public endpoints (no API key needed)
     async def okx_ticker_last_price(self, instId: str) -> Optional[float]:
@@ -319,6 +334,12 @@ class DataClient:
 # ───────────────────────────
 
 
+def _sma(vals: List[float], window: int) -> Optional[float]:
+    if len(vals) < window:
+        return None
+    return sum(vals[-window:]) / float(window)
+
+
 async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
     cg = await _safe(
         dc.coingecko_global(),
@@ -355,7 +376,7 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
     altcap = max(total_mcap - btc_mcap - eth_mcap, 0.0)
     altcap_btc_ratio = (altcap / btc_mcap) if btc_mcap > 0 else 0.0
 
-    # Google Trends + optional on-chain + fear & greed
+    # Google Trends + Fear & Greed + optional on-chain
     trends_avg, trends_by_kw = await _safe(
         dc.google_trends_score(["crypto", "bitcoin", "ethereum"]),
         (0.0, {"crypto": 0.0, "bitcoin": 0.0, "ethereum": 0.0}),
@@ -364,6 +385,16 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
     fng_value, fng_label = await _safe(dc.fear_greed(), (None, None), "fear_greed")
     mvrv_z = await _safe(dc.glassnode_mvrv_z("BTC"), None, "glassnode_mvrv_z")
     exch_inflow = await _safe(dc.glassnode_exchange_inflow("BTC"), None, "glassnode_exchange_inflow")
+
+    # Pi Cycle Top proximity (BTC 111DMA vs 2×350DMA)
+    btc_daily = await _safe(dc.coingecko_btc_daily(500), [], "btc_daily_prices")
+    sma111 = _sma(btc_daily, 111)
+    sma350 = _sma(btc_daily, 350)
+    pi_ratio = None
+    two_350 = None
+    if sma111 is not None and sma350 is not None and sma350 > 0:
+        two_350 = 2.0 * sma350
+        pi_ratio = sma111 / two_350
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -378,6 +409,12 @@ async def gather_metrics(dc: DataClient) -> Dict[str, Any]:
         "fear_greed_label": fng_label,
         "mvrv_z": mvrv_z,
         "exchange_inflow_proxy": exch_inflow,
+        "pi_cycle": {
+            "sma111": sma111,
+            "sma350x2": two_350,
+            # == 111DMA / (2*350DMA); >=1.00 is a cross/trigger
+            "ratio": pi_ratio,
+        },
     }
 
 # ───────────────────────────
@@ -439,47 +476,84 @@ def build_status_text(m: Dict[str, Any], t: Dict[str, Any] | None = None) -> str
     f_fng = bool(fng_val is not None and fng_val >=
                  t.get("fear_greed_greed_min", 70))
 
+    # Pi Cycle
+    pi = m.get("pi_cycle") or {}
+    pi_ratio = pi.get("ratio")
+    pi_flag = bool(pi_ratio is not None and pi_ratio >=
+                   t.get("pi_cycle_ratio_min", 0.98))
+
     lines: List[str] = []
     lines.append(f"📊 {b('Crypto Market Snapshot')} ({m['timestamp']} UTC)")
 
-    lines.append(f"• Bitcoin market share of total crypto market: "
-                 f"{bullet(f_dom)} {b(f'{dom:.2f}%')}  (flag ≥ {t['btc_dominance_max']:.2f}%)")
+    lines.append(
+        f"• Bitcoin market share of total crypto market: "
+        f"{bullet(f_dom)} {b(f'{dom:.2f}%')}  (flag ≥ {t['btc_dominance_max']:.2f}%)"
+    )
 
-    lines.append(f"• Ether price relative to Bitcoin (ETH/BTC): "
-                 f"{bullet(f_ethbtc)} {b(f'{ethbtc:.5f}')}  (flag ≥ {t['eth_btc_ratio_max']:.5f})")
+    lines.append(
+        f"• Ether price relative to Bitcoin (ETH/BTC): "
+        f"{bullet(f_ethbtc)} {b(f'{ethbtc:.5f}')}  (flag ≥ {t['eth_btc_ratio_max']:.5f})"
+    )
 
-    lines.append(f"• Altcoin market cap / Bitcoin market cap: "
-                 f"{bullet(f_altbtc)} {b(f'{altbtc:.2f}')}  (flag ≥ {t['altcap_btc_ratio_max']:.2f})")
+    lines.append(
+        f"• Altcoin market cap / Bitcoin market cap: "
+        f"{bullet(f_altbtc)} {b(f'{altbtc:.2f}')}  (flag ≥ {t['altcap_btc_ratio_max']:.2f})"
+    )
 
     if max_sym:
-        lines.append(f"• Perpetual funding rate (max absolute across watched pairs): "
-                     f"{bullet(f_fund)} {b(f'{max_fr:.3f}%')} on {max_sym}  "
-                     f"(flag ≥ {t['funding_rate_abs_max']:.3f}%)")
+        lines.append(
+            f"• Perpetual funding rate (max absolute across watched pairs): "
+            f"{bullet(f_fund)} {b(f'{max_fr:.3f}%')} on {max_sym}  "
+            f"(flag ≥ {t['funding_rate_abs_max']:.3f}%)"
+        )
     else:
         lines.append(f"• Perpetual funding rate: {bullet(False)} {b('n/a')}")
 
-    lines.append(f"• Bitcoin open interest (USD, estimate): "
-                 f"{bullet(f_btc_oi)} {b(fmt_usd(btc_oi))}  "
-                 f"(flag ≥ {fmt_usd(t['open_interest_btc_usdt_usd_max'])})")
+    lines.append(
+        f"• Bitcoin open interest (USD, estimate): "
+        f"{bullet(f_btc_oi)} {b(fmt_usd(btc_oi))}  "
+        f"(flag ≥ {fmt_usd(t['open_interest_btc_usdt_usd_max'])})"
+    )
 
-    lines.append(f"• Ether open interest (USD, estimate): "
-                 f"{bullet(f_eth_oi)} {b(fmt_usd(eth_oi))}  "
-                 f"(flag ≥ {fmt_usd(t['open_interest_eth_usdt_usd_max'])})")
+    lines.append(
+        f"• Ether open interest (USD, estimate): "
+        f"{bullet(f_eth_oi)} {b(fmt_usd(eth_oi))}  "
+        f"(flag ≥ {fmt_usd(t['open_interest_eth_usdt_usd_max'])})"
+    )
 
-    lines.append(f"• Google Trends (7-day average; crypto/bitcoin/ethereum): "
-                 f"{bullet(f_trends)} {b(f'{gavg:.1f}')}  "
-                 f"(flag ≥ {t['google_trends_7d_avg_min']:.1f})")
+    lines.append(
+        f"• Google Trends (7-day average; crypto/bitcoin/ethereum): "
+        f"{bullet(f_trends)} {b(f'{gavg:.1f}')}  "
+        f"(flag ≥ {t['google_trends_7d_avg_min']:.1f})"
+    )
 
     if fng_val is not None:
-        lines.append(f"• Fear & Greed Index (overall crypto): "
-                     f"{bullet(f_fng)} {b(str(fng_val))} ({fng_lab or 'n/a'})  "
-                     f"(flag ≥ {t.get('fear_greed_greed_min', 70)})")
+        lines.append(
+            f"• Fear & Greed Index (overall crypto): "
+            f"{bullet(f_fng)} {b(str(fng_val))} ({fng_lab or 'n/a'})  "
+            f"(flag ≥ {t.get('fear_greed_greed_min', 70)})"
+        )
+
+    # Pi Cycle line
+    if pi_ratio is not None and pi.get("sma111") and pi.get("sma350x2"):
+        pct = pi_ratio * 100.0
+        th_pct = t.get("pi_cycle_ratio_min", 0.98) * 100.0
+        lines.append(
+            f"• Pi Cycle Top proximity (111-day MA vs 2×350-day MA): "
+            f"{bullet(pi_flag)} {b(f'{pct:.1f}% of cross')} "
+            f"(111DMA {fmt_usd(pi['sma111'])}, 2×350DMA {fmt_usd(pi['sma350x2'])}; flag ≥ {th_pct:.1f}%)"
+        )
+    else:
+        lines.append("• Pi Cycle Top proximity: 🟢 " + b("n/a"))
 
     if m.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None:
-        f_mz = m["mvrv_z"] >= t["mvrv_z_extreme"]
-        lines.append(f"• Bitcoin MVRV Z-Score (on-chain valuation): "
-                     f"{bullet(f_mz)} {b(f'{m['mvrv_z']:.2f}')}  "
-                     f"(flag ≥ {t['mvrv_z_extreme']:.2f})")
+        mz_val = m["mvrv_z"]
+        f_mz = mz_val >= t["mvrv_z_extreme"]
+        lines.append(
+            f"• Bitcoin MVRV Z-Score (on-chain valuation): "
+            f"{bullet(f_mz)} {b(f'{mz_val:.2f}')}  "
+            f"(flag ≥ {t['mvrv_z_extreme']:.2f})"
+        )
 
     if flags_count > 0:
         lines.append("")
@@ -516,6 +590,10 @@ def evaluate_flags(m: Dict[str, Any], t: Dict[str, Any]) -> Tuple[int, List[str]
     fg = m.get("fear_greed_index")
     if fg is not None and fg >= t.get("fear_greed_greed_min", 70):
         flags.append("Greed is elevated (Fear & Greed Index)")
+    # Pi Cycle
+    pi = m.get("pi_cycle") or {}
+    if pi.get("ratio") is not None and pi["ratio"] >= t.get("pi_cycle_ratio_min", 0.98):
+        flags.append("Pi Cycle Top proximity elevated")
     # on-chain optional
     if m.get("mvrv_z") is not None and t.get("mvrv_z_extreme") is not None and m["mvrv_z"] >= t["mvrv_z_extreme"]:
         flags.append("On-chain overvaluation (MVRV Z-Score)")
@@ -611,7 +689,6 @@ async def cmd_assess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         profile = (CHAT_PROFILE.get(chat_id, CFG.default_profile)
                    if CFG.risk_profiles else "static")
 
-        # Build the same pretty block plus explicit flags at the end
         text = build_status_text(m, t)
         nflags, flags = evaluate_flags(m, t)
         lines = [text, "", f"• Active risk profile: {b(profile)}"]
