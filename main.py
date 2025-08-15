@@ -26,18 +26,14 @@ log = logging.getLogger("crypto-cycle-bot")
 # Config / Env
 # ----------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # required
-# daily snapshot hour
+# daily snapshot hour (UTC)
 SUMMARY_UTC_HOUR = int(os.getenv("SUMMARY_UTC_HOUR", "15"))
-# alerts cadence (cron-style minutes)
-ALERT_CRON_MINUTES = os.getenv("ALERT_CRON_MINUTES", "*/15")
+ALERT_CRON_MINUTES = os.getenv(
+    "ALERT_CRON_MINUTES", "*/15")  # periodic alerts schedule
 USER_AGENT = "crypto-cycle-telegram-bot/1.0 (+bot)"
 
 # Risk profiles (weights tweak multipliers)
-RISK_PROFILES = {
-    "conservative": 0.8,
-    "moderate": 1.0,
-    "aggressive": 1.2,
-}
+RISK_PROFILES = {"conservative": 0.8, "moderate": 1.0, "aggressive": 1.2}
 
 # Markets & baskets
 FUNDING_BASKET = [
@@ -47,18 +43,15 @@ FUNDING_BASKET = [
     ("XRP-USDT-SWAP", "XRPUSDT"),
     ("DOGE-USDT-SWAP", "DOGEUSDT"),
 ]
-
-ALT_BASKET = [
-    "SOL-USDT", "XRP-USDT", "DOGE-USDT", "ADA-USDT",
-    "BNB-USDT", "AVAX-USDT", "LINK-USDT", "MATIC-USDT"
-]
+ALT_BASKET = ["SOL-USDT", "XRP-USDT", "DOGE-USDT", "ADA-USDT",
+              "BNB-USDT", "AVAX-USDT", "LINK-USDT", "MATIC-USDT"]
 
 # Thresholds
 THRESH = {
     "btc_dominance_warn": 0.48, "btc_dominance_flag": 0.60,
     "eth_btc_warn": 0.072, "eth_btc_flag": 0.090,
     "altcap_btc_warn": 1.44, "altcap_btc_flag": 1.80,
-    "funding_warn": 0.0008, "funding_flag": 0.0010,   # 0.08% / 0.10%
+    "funding_warn": 0.0008, "funding_flag": 0.0010,  # 0.08% / 0.10%
     "oi_btc_warn": 16e9, "oi_btc_flag": 20e9,
     "oi_eth_warn": 6.4e9, "oi_eth_flag": 8e9,
     "trends_warn": 60.0, "trends_flag": 75.0,
@@ -75,8 +68,7 @@ THRESH = {
 
 # Runtime state (in-memory)
 SUBSCRIBERS: set[int] = set()
-# chat_id -> "conservative|moderate|aggressive"
-CHAT_PROFILE: Dict[int, str] = {}
+CHAT_PROFILE: Dict[int, str] = {}  # chat_id -> risk profile
 
 # ----------------------------
 # Utilities
@@ -148,19 +140,19 @@ def rsi(values: List[float], period: int = 14) -> Optional[float]:
 def stoch_rsi(values: List[float], period: int = 14, k: int = 3, d: int = 3) -> Tuple[Optional[float], Optional[float]]:
     if len(values) < period + max(k, d) + 1:
         return (None, None)
-    rsi_vals = []
+    rsi_vals: List[float] = []
     for i in range(period, len(values)):
         r = rsi(values[: i + 1], period)
         if r is not None:
             rsi_vals.append(r)
     if len(rsi_vals) < period:
         return (None, None)
-    srsi = []
+    srsi: List[float] = []
     for i in range(period, len(rsi_vals) + 1):
         window = rsi_vals[i - period: i]
         lo = min(window)
         hi = max(window)
-        srsi.append(0.5 if hi - lo ==
+        srsi.append(0.5 if (hi - lo) ==
                     0 else (rsi_vals[i - 1] - lo) / (hi - lo))
     if len(srsi) < k + d:
         return (None, None)
@@ -187,10 +179,10 @@ def fib_extension_proximity(weekly_closes: List[float], lookback: int = 52) -> O
     data = weekly_closes[-lookback:]
     lo = float(min(data))
     hi = float(max(data))
-    if hi <= lo:
+    if hi <= 0:
         return None
     rng = hi - lo
-    ext1272 = hi + 1.272 * rng  # 1.272 above swing high
+    ext1272 = hi + 1.272 * rng
     last = float(weekly_closes[-1])
     away = abs(ext1272 - last) / ext1272
     return (ext1272, away)
@@ -208,47 +200,44 @@ def pct_str(x: Optional[float], decimals: int = 2) -> str:
 
 class DataClient:
     def __init__(self):
-        self.client: Optional[httpx.AsyncClient] = None
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(
+            25.0), headers={"User-Agent": USER_AGENT})
 
     async def __aenter__(self):
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(20.0),
-                                        headers={"User-Agent": USER_AGENT})
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        # Close robustly across environments
         try:
-            if self.client is not None:
-                await self.client.aclose()
+            aclose = getattr(self.client, "aclose", None)
+            if aclose:
+                await aclose()
+                return
+            close = getattr(self.client, "close", None)
+            if close:
+                if asyncio.iscoroutinefunction(close):
+                    await close()
+                else:
+                    close()
         except Exception as e:
             log.warning("http client close error: %s", e)
 
-    async def _get(self, url: str, params: Optional[Dict[str, Any]] = None):
-        assert self.client is not None
-        for attempt in range(3):
-            try:
-                r = await self.client.get(url, params=params)
-                r.raise_for_status()
-                return r
-            except Exception as e:
-                log.warning("GET %s failed (attempt %d): %s",
-                            url, attempt + 1, e)
-                await asyncio.sleep(0.6 * (attempt + 1))
-        raise RuntimeError(f"Failed to fetch {url}")
-
-    # ---- OKX ----
+    # ---- OKX helpers ----
     async def okx_funding_and_ticker(self, inst_id: str) -> Tuple[Optional[float], Optional[float]]:
-        rate = None
-        last_price = None
+        rate: Optional[float] = None
+        last_price: Optional[float] = None
         try:
-            r = await self._get("https://www.okx.com/api/v5/public/funding-rate", {"instId": inst_id})
-            data = r.json().get("data", [])
-            rate = float(data[0].get("fundingRate")) if data else None
+            fr = await self.client.get("https://www.okx.com/api/v5/public/funding-rate", params={"instId": inst_id})
+            fr.raise_for_status()
+            f_data = fr.json().get("data", [])
+            rate = float(f_data[0].get("fundingRate")) if f_data else None
         except Exception as e:
             log.warning("funding fetch failed for %s: %s", inst_id, e)
         try:
-            r = await self._get("https://www.okx.com/api/v5/market/ticker", {"instId": inst_id})
-            data = r.json().get("data", [])
-            last_price = float(data[0].get("last")) if data else None
+            tk = await self.client.get("https://www.okx.com/api/v5/market/ticker", params={"instId": inst_id})
+            tk.raise_for_status()
+            t_data = tk.json().get("data", [])
+            last_price = float(t_data[0].get("last")) if t_data else None
         except Exception as e:
             log.warning("ticker fetch failed for %s: %s", inst_id, e)
         return (rate, last_price)
@@ -256,31 +245,34 @@ class DataClient:
     async def okx_open_interest_usd(self, inst_ids: List[str]) -> Optional[float]:
         total = 0.0
         got_any = False
-        spot_cache: Dict[str, float] = {}
+        last_cache: Dict[str, float] = {}
         for inst_id in inst_ids:
             try:
-                r = await self._get("https://www.okx.com/api/v5/public/open-interest",
-                                    {"instType": "SWAP", "instId": inst_id})
+                r = await self.client.get("https://www.okx.com/api/v5/public/open-interest",
+                                          params={"instType": "SWAP", "instId": inst_id})
+                r.raise_for_status()
                 data = r.json().get("data", [])
                 for row in data:
-                    oi_usd_str = row.get("oiUsd")
-                    if oi_usd_str not in (None, "", "0"):
-                        total += float(oi_usd_str)
+                    oi_usd = row.get("oiUsd")
+                    if oi_usd not in (None, "", "0"):
+                        total += float(oi_usd)
                         got_any = True
                         continue
                     oi_ccy = float(row.get("oiCcy", 0.0) or 0.0)
                     if oi_ccy > 0.0:
                         base = inst_id.split("-")[0]
                         spot = f"{base}-USDT"
-                        if spot not in spot_cache:
+                        if spot not in last_cache:
                             try:
-                                tk = await self._get("https://www.okx.com/api/v5/market/ticker", {"instId": spot})
+                                tk = await self.client.get("https://www.okx.com/api/v5/market/ticker", params={"instId": spot})
+                                tk.raise_for_status()
                                 t_data = tk.json().get("data", [])
-                                spot_cache[spot] = float(
-                                    t_data[0].get("last")) if t_data else 0.0
+                                if t_data:
+                                    last_cache[spot] = float(
+                                        t_data[0].get("last"))
                             except Exception:
-                                spot_cache[spot] = 0.0
-                        last_p = spot_cache.get(spot, 0.0)
+                                last_cache[spot] = 0.0
+                        last_p = last_cache.get(spot, 0.0)
                         if last_p > 0.0:
                             total += oi_ccy * last_p
                             got_any = True
@@ -297,8 +289,9 @@ class DataClient:
 
     async def okx_weekly_closes(self, inst_id: str, limit: int = 400) -> Optional[List[float]]:
         try:
-            r = await self._get("https://www.okx.com/api/v5/market/candles",
-                                {"instId": inst_id, "bar": "1W", "limit": str(limit)})
+            r = await self.client.get("https://www.okx.com/api/v5/market/candles",
+                                      params={"instId": inst_id, "bar": "1W", "limit": str(limit)})
+            r.raise_for_status()
             rows = r.json().get("data", [])
             if not rows:
                 return None
@@ -308,10 +301,11 @@ class DataClient:
             log.warning("weekly candles failed for %s: %s", inst_id, e)
             return None
 
-    async def okx_daily_closes(self, inst_id: str, limit: int = 500) -> Optional[List[float]]:
+    async def okx_daily_closes(self, inst_id: str, limit: int = 800) -> Optional[List[float]]:
         try:
-            r = await self._get("https://www.okx.com/api/v5/market/candles",
-                                {"instId": inst_id, "bar": "1D", "limit": str(limit)})
+            r = await self.client.get("https://www.okx.com/api/v5/market/candles",
+                                      params={"instId": inst_id, "bar": "1D", "limit": str(limit)})
+            r.raise_for_status()
             rows = r.json().get("data", [])
             if not rows:
                 return None
@@ -321,35 +315,14 @@ class DataClient:
             log.warning("daily candles failed for %s: %s", inst_id, e)
             return None
 
-    # ---- Kraken ----
-    async def kraken_daily_closes(self, pair: str) -> Optional[List[float]]:
+    async def coinbase_daily_closes(self, product_id: str, limit: int = 800) -> Optional[List[float]]:
         try:
-            r = await self._get("https://api.kraken.com/0/public/OHLC",
-                                {"pair": pair, "interval": "1440"})
-            js = r.json().get("result", {})
-            series = None
-            for k, v in js.items():
-                if k == "last":
-                    continue
-                if isinstance(v, list) and v and isinstance(v[0], list):
-                    series = v
-                    break
-            if not series:
-                return None
-            closes = [float(x[4]) for x in series]  # oldest->newest
-            return closes
-        except Exception as e:
-            log.warning("kraken OHLC failed for %s: %s", pair, e)
-            return None
-
-    # ---- Coinbase ----
-    async def coinbase_daily_closes(self, product_id: str) -> Optional[List[float]]:
-        try:
-            r = await self._get(
+            r = await self.client.get(
                 f"https://api.exchange.coinbase.com/products/{product_id}/candles",
-                {"granularity": 86400}
+                params={"granularity": 86400, "limit": str(limit)}
             )
-            rows = r.json()  # newest first
+            r.raise_for_status()
+            rows = r.json()
             if not rows:
                 return None
             closes = [float(x[4]) for x in sorted(rows, key=lambda z: z[0])]
@@ -362,7 +335,8 @@ class DataClient:
     # ---- Other data ----
     async def coingecko_global(self) -> Optional[Dict[str, Any]]:
         try:
-            r = await self._get("https://api.coingecko.com/api/v3/global")
+            r = await self.client.get("https://api.coingecko.com/api/v3/global")
+            r.raise_for_status()
             return r.json().get("data", {})
         except Exception as e:
             log.warning("coingecko global failed: %s", e)
@@ -370,12 +344,13 @@ class DataClient:
 
     async def coingecko_prices(self, ids: List[str]) -> Dict[str, float]:
         try:
-            r = await self._get(
+            r = await self.client.get(
                 "https://api.coingecko.com/api/v3/simple/price",
-                {"ids": ",".join(ids), "vs_currencies": "usd"}
+                params={"ids": ",".join(ids), "vs_currencies": "usd"}
             )
+            r.raise_for_status()
             data = r.json()
-            out = {}
+            out: Dict[str, float] = {}
             for cid in ids:
                 usd = data.get(cid, {}).get("usd")
                 if usd is not None:
@@ -387,14 +362,16 @@ class DataClient:
 
     async def fear_greed(self) -> Optional[Dict[str, Any]]:
         try:
-            r1 = await self._get("https://api.alternative.me/fng/", {"limit": "1"})
+            r1 = await self.client.get("https://api.alternative.me/fng/", params={"limit": "1"})
+            r1.raise_for_status()
             now_data = r1.json().get("data", [])
             now_val = int(now_data[0].get("value")) if now_data else None
 
-            r2 = await self._get("https://api.alternative.me/fng/", {"limit": "60"})
+            r2 = await self.client.get("https://api.alternative.me/fng/", params={"limit": "60"})
+            r2.raise_for_status()
             hist = r2.json().get("data", [])
-            vals = [int(x.get("value"))
-                    for x in hist if x.get("value") is not None][::-1]
+            vals = [int(x.get("value")) for x in hist if x.get(
+                "value") is not None][::-1]  # oldest->newest
             ma14 = float(np.mean(vals[-14:])) if len(vals) >= 14 else None
             ma30 = float(np.mean(vals[-30:])) if len(vals) >= 30 else None
             greedy_days = sum(
@@ -436,26 +413,6 @@ class DataClient:
                 return None
         return await asyncio.to_thread(_fetch)
 
-    # ---- Aggregated BTC 1D closes for Pi ----
-    async def btc_daily_closes(self) -> Optional[List[float]]:
-        # 1) OKX
-        okx = await self.okx_daily_closes("BTC-USDT", limit=500)
-        if okx and len(okx) >= 360:
-            return okx
-        # 2) Kraken (new-style and legacy pair keys)
-        kr = await self.kraken_daily_closes("XBTUSD")
-        if (not kr) or len(kr) < 360:
-            kr = await self.kraken_daily_closes("XXBTZUSD")
-        if kr and len(kr) >= 360:
-            return kr
-        # 3) Coinbase
-        cb = await self.coinbase_daily_closes("BTC-USD")
-        if cb and len(cb) >= 360:
-            return cb
-        # Fallback: return the longest we have
-        longest = max([x for x in [okx, kr, cb] if x], key=len, default=None)
-        return longest
-
 # ----------------------------
 # Metrics Builder
 # ----------------------------
@@ -469,11 +426,15 @@ async def build_metrics() -> Dict[str, Any]:
         altcap_btc_ratio = None
         if cg:
             md = cg.get("market_cap_percentage", {})
-            btc_pct = md.get("btc")
-            if btc_pct is not None:
-                btc_dom = float(btc_pct) / 100.0
-                if 0 < btc_dom < 1:
-                    altcap_btc_ratio = (1.0 - btc_dom) / btc_dom
+            total = cg.get("total_market_cap", {}).get("usd")
+            btc_mcap = None
+            if isinstance(total, (int, float)):
+                btc_pct = md.get("btc")
+                if btc_pct is not None:
+                    btc_dom = float(btc_pct) / 100.0
+                    btc_mcap = total * btc_dom
+                if btc_mcap and btc_mcap > 0:
+                    altcap_btc_ratio = (total - btc_mcap) / btc_mcap
 
         prices = await dc.coingecko_prices(["bitcoin", "ethereum"])
         btc_usd = prices.get("bitcoin")
@@ -481,7 +442,7 @@ async def build_metrics() -> Dict[str, Any]:
         eth_btc = (eth_usd / btc_usd) if (eth_usd and btc_usd) else None
 
         # Derivatives: funding basket
-        basket_rates = []
+        basket_rates: List[float] = []
         for inst_id, _alias in FUNDING_BASKET:
             rate, _lp = await dc.okx_funding_and_ticker(inst_id)
             if rate is not None:
@@ -503,12 +464,12 @@ async def build_metrics() -> Dict[str, Any]:
         ethbtc_w = await dc.okx_weekly_closes("ETH-BTC")
 
         # Alt basket composite close (equal weight)
-        alt_closes_list = []
+        alt_closes_list: List[List[float]] = []
         for sym in ALT_BASKET:
             closes = await dc.okx_weekly_closes(sym)
             if closes:
                 alt_closes_list.append(closes)
-        alt_index = None
+        alt_index: Optional[List[float]] = None
         if alt_closes_list:
             lens = [len(x) for x in alt_closes_list]
             L = min(lens)
@@ -535,9 +496,9 @@ async def build_metrics() -> Dict[str, Any]:
             return float(pd.Series(vals[-n:]).mean())
 
         rsi_btc2w_ma = ma_of_series([rsi(btc_2w[:i], 14) or 50.0 for i in range(
-            15, len(btc_2w)+1)]) if btc_2w and len(btc_2w) >= 30 else None
+            15, len(btc_2w) + 1)]) if btc_2w and len(btc_2w) >= 30 else None
         rsi_alt2w_ma = ma_of_series([rsi(alt_2w[:i], 14) or 50.0 for i in range(
-            15, len(alt_2w)+1)]) if alt_2w and len(alt_2w) >= 30 else None
+            15, len(alt_2w) + 1)]) if alt_2w and len(alt_2w) >= 30 else None
 
         # Stoch RSI on 2W
         k_btc2w, d_btc2w = stoch_rsi(
@@ -549,14 +510,20 @@ async def build_metrics() -> Dict[str, Any]:
         btc_fib = fib_extension_proximity(btc_w) if btc_w else None
         alt_fib = fib_extension_proximity(alt_index) if alt_index else None
 
-        # Pi Cycle Top proximity: ratio (1.0 = cross = MA111 / (2*MA350))
-        btc_d = await dc.btc_daily_closes()
+        # Pi Cycle Top proximity: OKX daily BTC-USDT closes; fallback Coinbase BTC-USD
+        btc_d = await dc.okx_daily_closes("BTC-USDT", limit=800)
+        if not btc_d:
+            btc_d = await dc.coinbase_daily_closes("BTC-USD", limit=800)
         pi_prox = None
-        if btc_d and len(btc_d) >= 360:
+        if btc_d and len(btc_d) >= 400:
             ma111 = simple_sma(btc_d, 111)
             ma350 = simple_sma(btc_d, 350)
-            if (ma111 is not None) and (ma350 is not None) and (ma350 > 0):
-                pi_prox = float(ma111 / (2.0 * ma350))
+            ma700 = (ma350 * 2.0) if ma350 is not None else None
+            if ma111 is not None and ma700 is not None and (ma111 + ma700) > 0:
+                # 0% far apart … 100% = cross
+                diff = abs(ma111 - ma700)
+                denom = (ma111 + ma700) / 2.0
+                pi_prox = max(0.0, 1.0 - (diff / denom))
 
         return {
             "btc_dom": btc_dom, "eth_btc": eth_btc, "altcap_btc_ratio": altcap_btc_ratio,
@@ -597,20 +564,11 @@ def score_component(value: Optional[float], good_low: bool, warn: float, flag: f
 
 def alt_top_certainty(m: Dict[str, Any], profile: str) -> float:
     w = {
-        "altcap_vs_btc": 0.10,
-        "eth_btc": 0.08,
-        "funding": 0.08,
-        "oi_btc": 0.08,
-        "oi_eth": 0.08,
-        "trends": 0.06,
-        "fng_now": 0.06,
-        "fng_ma14": 0.06,
-        "fng_ma30": 0.08,
-        "fng_persist": 0.06,
-        "pi": 0.08,
-        "rsi_btc2w": 0.06,
-        "rsi_ethbtc2w": 0.06,
-        "rsi_alt2w": 0.06,
+        "altcap_vs_btc": 0.10, "eth_btc": 0.08, "funding": 0.08,
+        "oi_btc": 0.08, "oi_eth": 0.08, "trends": 0.06,
+        "fng_now": 0.06, "fng_ma14": 0.06, "fng_ma30": 0.08,
+        "fng_persist": 0.06, "pi": 0.08,
+        "rsi_btc2w": 0.06, "rsi_ethbtc2w": 0.06, "rsi_alt2w": 0.06,
     }
     mult = RISK_PROFILES.get(profile, 1.0)
 
@@ -642,8 +600,8 @@ def alt_top_certainty(m: Dict[str, Any], profile: str) -> float:
         persist_pct, True, THRESH["fng_persist_pct_warn"], THRESH["fng_persist_pct_flag"])
     s_persist = 0.5 * s_persist_days + 0.5 * s_persist_pct
 
-    pi_p = m.get("pi_prox")  # 1.0 = cross
-    s_pi = 50.0 if pi_p is None else max(0.0, min(100.0, float(pi_p) * 100.0))
+    pi_p = m.get("pi_prox")
+    s_pi = 50.0 if pi_p is None else max(0.0, min(100.0, pi_p * 100.0))
 
     s_rsi_b = score_component(m.get("rsi_btc2w"), True,
                               THRESH["rsi_btc2w_warn"], THRESH["rsi_btc2w_flag"])
@@ -737,8 +695,8 @@ def build_text_snapshot(m: Dict[str, Any], profile: str) -> str:
         persist_flag = "yellow"
     persist_g = col(persist_flag)
 
-    # Cycle & on-chain (Pi)
-    pi_p = m.get("pi_prox")  # ratio; 1.0 = cross
+    # Cycle & on-chain
+    pi_p = m.get("pi_prox")
     pi_g = "🟡" if pi_p is None else (
         "🟢" if pi_p < 0.7 else ("🟡" if pi_p < 0.9 else "🔴"))
     pi_txt = "n/a" if pi_p is None else f"{pi_p*100:.2f}% of trigger (100% = cross)"
@@ -769,7 +727,7 @@ def build_text_snapshot(m: Dict[str, Any], profile: str) -> str:
         "yellow" if certainty < 70 else "red")
     cert_g = col(cert_flag)
 
-    lines = []
+    lines: List[str] = []
     lines.append(f"📊 Crypto Market Snapshot — {now_iso}")
     lines.append(f"Profile: {profile}")
     lines.append("")
@@ -1057,7 +1015,7 @@ async def start_health_server():
     site = web.TCPSite(runner, host="0.0.0.0", port=8080)
     await site.start()
     log.info("Health server listening on :8080")
-    return runner
+    return runner, site
 
 # ----------------------------
 # Main
@@ -1080,35 +1038,31 @@ async def main():
     application.add_handler(CommandHandler("assess", cmd_assess))
 
     # Health server
-    runner = await start_health_server()
+    runner, _site = await start_health_server()
 
-    # Initialize & delete webhook to enable polling
-    await application.initialize()
-    await application.bot.delete_webhook()
-    log.info("Deleted webhook (if any); switching to long polling.")
-    await application.start()
-
-    # Scheduler (after app is started)
+    # Scheduler
     scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(lambda: asyncio.create_task(job_push_summary(application)),
-                      trigger="cron", hour=SUMMARY_UTC_HOUR, minute=0)
-    scheduler.add_job(lambda: asyncio.create_task(job_push_alerts(application)),
-                      trigger="cron", minute=ALERT_CRON_MINUTES)
+    scheduler.add_job(lambda: asyncio.create_task(job_push_summary(
+        application)), trigger="cron", hour=SUMMARY_UTC_HOUR, minute=0)
+    scheduler.add_job(lambda: asyncio.create_task(job_push_alerts(
+        application)), trigger="cron", minute=ALERT_CRON_MINUTES)
     scheduler.start()
     log.info("Scheduler started")
 
-    # Start polling without taking over the loop
+    # Start long polling (non-blocking) and wait forever
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    await application.initialize()
+    await application.start()
     if application.updater:
         await application.updater.start_polling()
     log.info("Application started; polling for updates.")
 
+    stop_event = asyncio.Event()
     try:
-        while True:
-            await asyncio.sleep(3600)
+        await stop_event.wait()  # run forever; Ctrl+C triggers CancelledError
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
     finally:
-        # Graceful shutdown
         if application.updater:
             await application.updater.stop()
         await application.stop()
