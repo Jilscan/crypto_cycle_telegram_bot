@@ -178,8 +178,7 @@ def stoch_rsi(values: List[float], period: int = 14, k: int = 3, d: int = 3) -> 
 def downsample_2w(closes: List[float]) -> List[float]:
     if not closes:
         return []
-    # oldest->newest weekly -> 2W by skipping each other bar
-    return closes[1::2]
+    return closes[1::2]  # oldest->newest weekly -> 2W
 
 
 def fib_extension_proximity(weekly_closes: List[float], lookback: int = 52) -> Optional[Tuple[float, float]]:
@@ -216,7 +215,25 @@ class DataClient:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        await self.client.close()
+        """
+        Robustly close the underlying HTTP client.
+        Prefer aclose(); gracefully fallback if running against a
+        non-standard shim that only exposes close().
+        """
+        try:
+            aclose = getattr(self.client, "aclose", None)
+            if aclose:
+                await aclose()
+                return
+            close = getattr(self.client, "close", None)
+            if close:
+                if asyncio.iscoroutinefunction(close):
+                    await close()
+                else:
+                    close()
+        except Exception as e:
+            # Never propagate close errors; just log them.
+            log.warning("http client close error: %s", e)
 
     # ---- OKX helpers ----
     async def okx_funding_and_ticker(self, inst_id: str) -> Tuple[Optional[float], Optional[float]]:
@@ -241,7 +258,6 @@ class DataClient:
     async def okx_open_interest_usd(self, inst_ids: List[str]) -> Optional[float]:
         total = 0.0
         got_any = False
-        # Cache of last prices for spot-like pair for valuation if needed
         last_cache: Dict[str, float] = {}
         for inst_id in inst_ids:
             try:
@@ -250,16 +266,14 @@ class DataClient:
                 r.raise_for_status()
                 data = r.json().get("data", [])
                 for row in data:
-                    # Prefer direct USD fields if available
                     oi_usd_str = row.get("oiUsd")
                     if oi_usd_str not in (None, "", "0"):
                         total += float(oi_usd_str)
                         got_any = True
                         continue
-                    # Next: value using oiCcy * last price of base vs USDT
                     oi_ccy = float(row.get("oiCcy", 0.0) or 0.0)
                     if oi_ccy > 0.0:
-                        base = inst_id.split("-")[0]  # e.g., "BTC"
+                        base = inst_id.split("-")[0]
                         spot = f"{base}-USDT"
                         if spot not in last_cache:
                             try:
@@ -276,9 +290,7 @@ class DataClient:
                             total += oi_ccy * last_p
                             got_any = True
                             continue
-                    # Fallback: contracts * contract value
                     oi = float(row.get("oi", 0.0) or 0.0)
-                    # face value in quote (USDT)
                     ct_val = float(row.get("ctVal", 0.0) or 0.0)
                     if oi > 0.0 and ct_val > 0.0:
                         total += oi * ct_val
@@ -431,7 +443,6 @@ async def build_metrics() -> Dict[str, Any]:
             btc_mcap = None
             if total and isinstance(total, (int, float)):
                 btc_pct = md.get("btc")
-                eth_pct = md.get("eth")
                 if btc_pct is not None:
                     btc_dom = float(btc_pct) / 100.0
                     btc_mcap = total * btc_dom
@@ -454,7 +465,7 @@ async def build_metrics() -> Dict[str, Any]:
         funding_median = float(np.median(basket_rates)
                                ) if basket_rates else None
 
-        # Open interest (sum both USDT and USD swaps for safety)
+        # Open interest (sum both USDT and USD swaps)
         oi_btc = await dc.okx_open_interest_usd(["BTC-USDT-SWAP", "BTC-USD-SWAP"])
         oi_eth = await dc.okx_open_interest_usd(["ETH-USDT-SWAP", "ETH-USD-SWAP"])
 
@@ -465,7 +476,7 @@ async def build_metrics() -> Dict[str, Any]:
         # Momentum: weekly and 2W
         btc_w = await dc.okx_weekly_closes("BTC-USDT")
         ethbtc_w = await dc.okx_weekly_closes("ETH-BTC")
-        # Alt basket composite close (equal weight index)
+        # Alt basket composite close (equal weight)
         alt_closes_list = []
         for sym in ALT_BASKET:
             closes = await dc.okx_weekly_closes(sym)
@@ -1000,7 +1011,6 @@ async def job_push_summary(app: Application):
 
 
 async def job_push_alerts(app: Application):
-    # For now, re-send condensed snapshot to subscribers (you can add real alert triggers here)
     if not SUBSCRIBERS:
         return
     for chat_id in list(SUBSCRIBERS):
@@ -1062,7 +1072,7 @@ async def main():
     scheduler.start()
     log.info("Scheduler started")
 
-    # Start polling without taking over the loop (prevents 'loop already running')
+    # Start polling without taking over the loop
     await application.initialize()
     await application.start()
     if application.updater:
@@ -1071,13 +1081,11 @@ async def main():
     log.info("Bot running. Press Ctrl+C to exit.")
 
     try:
-        # keep the process alive
         while True:
             await asyncio.sleep(3600)
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
     finally:
-        # graceful shutdown
         if application.updater:
             await application.updater.stop()
         await application.stop()
