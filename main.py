@@ -189,7 +189,8 @@ def fib_extension_proximity(weekly_closes: List[float], lookback: int = 52) -> O
     hi = float(max(data))
     if hi <= lo:
         return None
-    ext1272 = lo + 1.272 * (hi - lo)
+    rng = hi - lo
+    ext1272 = hi + 1.272 * rng  # 1.272 above swing high
     last = float(weekly_closes[-1])
     away = abs(ext1272 - last) / ext1272
     return (ext1272, away)
@@ -548,9 +549,9 @@ async def build_metrics() -> Dict[str, Any]:
         btc_fib = fib_extension_proximity(btc_w) if btc_w else None
         alt_fib = fib_extension_proximity(alt_index) if alt_index else None
 
-        # Pi Cycle Top proximity (% of trigger)
+        # Pi Cycle Top proximity: ratio (1.0 = cross = MA111 / (2*MA350))
         btc_d = await dc.btc_daily_closes()
-        pi_prox = None  # ratio; 1.0 = cross
+        pi_prox = None
         if btc_d and len(btc_d) >= 360:
             ma111 = simple_sma(btc_d, 111)
             ma350 = simple_sma(btc_d, 350)
@@ -576,6 +577,7 @@ async def build_metrics() -> Dict[str, Any]:
 
 
 def score_component(value: Optional[float], good_low: bool, warn: float, flag: float) -> float:
+    # Returns 0..100 (higher = riskier)
     if value is None:
         return 50.0
     v = float(value)
@@ -735,11 +737,11 @@ def build_text_snapshot(m: Dict[str, Any], profile: str) -> str:
         persist_flag = "yellow"
     persist_g = col(persist_flag)
 
-    # Cycle & On-Chain (Pi)
+    # Cycle & on-chain (Pi)
     pi_p = m.get("pi_prox")  # ratio; 1.0 = cross
     pi_g = "🟡" if pi_p is None else (
         "🟢" if pi_p < 0.7 else ("🟡" if pi_p < 0.9 else "🔴"))
-    pi_txt = "n/a" if pi_p is None else f"{pi_p*100.0:.2f}% of trigger (100% = cross)"
+    pi_txt = "n/a" if pi_p is None else f"{pi_p*100:.2f}% of trigger (100% = cross)"
 
     # Momentum (2W) & Extensions (1W)
     rsi_btc2w = m.get("rsi_btc2w")
@@ -773,18 +775,25 @@ def build_text_snapshot(m: Dict[str, Any], profile: str) -> str:
     lines.append("")
     lines.append("Market Structure")
     if dom_val is not None:
-        lines.append("• Bitcoin market share of total crypto: {} {:.2f}%  (warn ≥ {:.2f}%, flag ≥ {:.2f}%)".format(
-            dom_g, dom_val*100.0, THRESH["btc_dominance_warn"]*100.0, THRESH["btc_dominance_flag"]*100.0))
+        lines.append(
+            "• Bitcoin market share of total crypto: {} {:.2f}%  (warn ≥ {:.2f}%, flag ≥ {:.2f}%)".format(
+                dom_g, dom_val *
+                100.0, THRESH["btc_dominance_warn"] *
+                100.0, THRESH["btc_dominance_flag"] * 100.0
+            )
+        )
     else:
         lines.append("• Bitcoin market share of total crypto: 🟡 n/a")
     if eth_btc_val is not None:
         lines.append("• Ether price relative to Bitcoin (ETH/BTC): {} {:.5f}  (warn ≥ {:.5f}, flag ≥ {:.5f})".format(
-            ethbtc_g, eth_btc_val, THRESH["eth_btc_warn"], THRESH["eth_btc_flag"]))
+            ethbtc_g, eth_btc_val, THRESH["eth_btc_warn"], THRESH["eth_btc_flag"]
+        ))
     else:
         lines.append("• Ether price relative to Bitcoin (ETH/BTC): 🟡 n/a")
     if altcap_val is not None:
         lines.append("• Altcoin market cap / Bitcoin market cap: {} {:.2f}  (warn ≥ {:.2f}, flag ≥ {:.2f})".format(
-            altcap_g, altcap_val, THRESH["altcap_btc_warn"], THRESH["altcap_btc_flag"]))
+            altcap_g, altcap_val, THRESH["altcap_btc_warn"], THRESH["altcap_btc_flag"]
+        ))
     else:
         lines.append("• Altcoin market cap / Bitcoin market cap: 🟡 n/a")
 
@@ -793,41 +802,56 @@ def build_text_snapshot(m: Dict[str, Any], profile: str) -> str:
     if fund_max is None and fund_med is None:
         lines.append("• Funding basket: 🟡 n/a")
     else:
-        lines.append("• Funding (basket: BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT, DOGEUSDT) — max: {} {} | median: {} {}  (warn ≥ {:.3f}%, flag ≥ {:.3f}%)".format(
-            fund_g_max, pct_str(fund_max, 3), fund_g_med, pct_str(fund_med, 3),
-            THRESH['funding_warn']*100.0, THRESH['funding_flag']*100.0))
+        lines.append(
+            "• Funding (basket: BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT, DOGEUSDT) — max: {} {} | median: {} {}  (warn ≥ {:.3f}%, flag ≥ {:.3f}%)".format(
+                fund_g_max, pct_str(
+                    fund_max, 3), fund_g_med, pct_str(fund_med, 3),
+                THRESH['funding_warn'] * 100.0, THRESH['funding_flag'] * 100.0
+            )
+        )
     lines.append("• Bitcoin open interest (USD): {} {}  (warn ≥ {}, flag ≥ {})".format(
-        oi_btc_g, to_human_dollar(oi_btc), to_human_dollar(THRESH['oi_btc_warn']), to_human_dollar(THRESH['oi_btc_flag'])))
+        oi_btc_g, to_human_dollar(oi_btc), to_human_dollar(
+            THRESH['oi_btc_warn']), to_human_dollar(THRESH['oi_btc_flag'])
+    ))
     lines.append("• Ether open interest (USD): {} {}  (warn ≥ {}, flag ≥ {})".format(
-        oi_eth_g, to_human_dollar(oi_eth), to_human_dollar(THRESH['oi_eth_warn']), to_human_dollar(THRESH['oi_eth_flag'])))
+        oi_eth_g, to_human_dollar(oi_eth), to_human_dollar(
+            THRESH['oi_eth_warn']), to_human_dollar(THRESH['oi_eth_flag'])
+    ))
 
     lines.append("")
     lines.append("Sentiment")
     if trends is not None:
         lines.append("• Google Trends avg (7d; crypto/bitcoin/ethereum): {} {:.1f}  (warn ≥ {:.1f}, flag ≥ {:.1f})".format(
-            trends_g, trends, THRESH["trends_warn"], THRESH["trends_flag"]))
+            trends_g, trends, THRESH["trends_warn"], THRESH["trends_flag"]
+        ))
     else:
         lines.append(
             "• Google Trends avg (7d; crypto/bitcoin/ethereum): 🟡 n/a")
     if fng_now is not None:
         lines.append("• Fear & Greed Index (overall crypto): {} {}  (warn ≥ {}, flag ≥ {})".format(
-            fng_now_g, fng_now, THRESH["fng_warn"], THRESH["fng_flag"]))
+            fng_now_g, fng_now, THRESH["fng_warn"], THRESH["fng_flag"]
+        ))
     else:
         lines.append("• Fear & Greed Index (overall crypto): 🟡 n/a")
     if fng14 is not None:
         lines.append("• Fear & Greed 14-day average: {} {:.1f}  (warn ≥ {}, flag ≥ {})".format(
-            fng14_g, fng14, THRESH["fng14_warn"], THRESH["fng14_flag"]))
+            fng14_g, fng14, THRESH["fng14_warn"], THRESH["fng14_flag"]
+        ))
     else:
         lines.append("• Fear & Greed 14-day average: 🟡 n/a")
     if fng30 is not None:
         lines.append("• Fear & Greed 30-day average: {} {:.1f}  (warn ≥ {}, flag ≥ {})".format(
-            fng30_g, fng30, THRESH["fng30_warn"], THRESH["fng30_flag"]))
+            fng30_g, fng30, THRESH["fng30_warn"], THRESH["fng30_flag"]
+        ))
     else:
         lines.append("• Fear & Greed 30-day average: 🟡 n/a")
     if (fng_streak is not None) and (fng_pct is not None):
-        pct_disp = int((fng_pct or 0.0) * 100)
-        lines.append("• Greed persistence: {} {} days in a row | {}% of last 30 days ≥ 70  (warn: days ≥ {} or pct ≥ {}%; flag: days ≥ {} or pct ≥ {}%)".format(
-            persist_g, fng_streak, pct_disp, days_warn, int(pct_warn*100), days_flag, int(pct_flag*100)))
+        lines.append(
+            "• Greed persistence: {} {} days in a row | {}% of last 30 days ≥ 70  (warn: days ≥ {} or pct ≥ {}%; flag: days ≥ {} or pct ≥ {}%)".format(
+                persist_g, fng_streak, int((fng_pct or 0.0) * 100),
+                days_warn, int(pct_warn * 100), days_flag, int(pct_flag * 100)
+            )
+        )
     else:
         lines.append("• Greed persistence: 🟡 n/a")
 
@@ -840,38 +864,45 @@ def build_text_snapshot(m: Dict[str, Any], profile: str) -> str:
     if rsi_btc2w is not None:
         if rsi_btc2w_ma is not None:
             lines.append("• BTC RSI (2W): {} {:.1f} (MA {:.1f}) (warn ≥ {:.1f}, flag ≥ {:.1f})".format(
-                rsi_btc_g, rsi_btc2w, rsi_btc2w_ma, THRESH["rsi_btc2w_warn"], THRESH["rsi_btc2w_flag"]))
+                rsi_btc_g, rsi_btc2w, rsi_btc2w_ma, THRESH["rsi_btc2w_warn"], THRESH["rsi_btc2w_flag"]
+            ))
         else:
             lines.append("• BTC RSI (2W): {} {:.1f} (warn ≥ {:.1f}, flag ≥ {:.1f})".format(
-                rsi_btc_g, rsi_btc2w, THRESH["rsi_btc2w_warn"], THRESH["rsi_btc2w_flag"]))
+                rsi_btc_g, rsi_btc2w, THRESH["rsi_btc2w_warn"], THRESH["rsi_btc2w_flag"]
+            ))
     else:
         lines.append("• BTC RSI (2W): 🟡 n/a")
 
     if rsi_ethbtc2w is not None:
         lines.append("• ETH/BTC RSI (2W): {} {:.1f} (warn ≥ {:.1f}, flag ≥ {:.1f})".format(
-            rsi_ethbtc_g, rsi_ethbtc2w, THRESH["rsi_ethbtc2w_warn"], THRESH["rsi_ethbtc2w_flag"]))
+            rsi_ethbtc_g, rsi_ethbtc2w, THRESH["rsi_ethbtc2w_warn"], THRESH["rsi_ethbtc2w_flag"]
+        ))
     else:
         lines.append("• ETH/BTC RSI (2W): 🟡 n/a")
 
     if rsi_alt2w is not None:
         if rsi_alt2w_ma is not None:
             lines.append("• ALT basket (equal-weight) RSI (2W): {} {:.1f} (MA {:.1f}) (warn ≥ {:.1f}, flag ≥ {:.1f})".format(
-                rsi_alt_g, rsi_alt2w, rsi_alt2w_ma, THRESH["rsi_alt2w_warn"], THRESH["rsi_alt2w_flag"]))
+                rsi_alt_g, rsi_alt2w, rsi_alt2w_ma, THRESH["rsi_alt2w_warn"], THRESH["rsi_alt2w_flag"]
+            ))
         else:
             lines.append("• ALT basket (equal-weight) RSI (2W): {} {:.1f} (warn ≥ {:.1f}, flag ≥ {:.1f})".format(
-                rsi_alt_g, rsi_alt2w, THRESH["rsi_alt2w_warn"], THRESH["rsi_alt2w_flag"]))
+                rsi_alt_g, rsi_alt2w, THRESH["rsi_alt2w_warn"], THRESH["rsi_alt2w_flag"]
+            ))
     else:
         lines.append("• ALT basket (equal-weight) RSI (2W): 🟡 n/a")
 
     if (k_btc2w is not None) and (d_btc2w is not None):
         lines.append("• BTC Stoch RSI (2W) K/D: {:.2f}/{:.2f} (overbought ≥ 0.80; red = bearish cross from OB)".format(
-            k_btc2w, d_btc2w))
+            k_btc2w, d_btc2w
+        ))
     else:
         lines.append("• BTC Stoch RSI (2W) K/D: 🟡 n/a")
 
     if (k_alt2w is not None) and (d_alt2w is not None):
         lines.append("• ALT basket Stoch RSI (2W) K/D: {:.2f}/{:.2f} (overbought ≥ 0.80; red = bearish cross from OB)".format(
-            k_alt2w, d_alt2w))
+            k_alt2w, d_alt2w
+        ))
     else:
         lines.append("• ALT basket Stoch RSI (2W) K/D: 🟡 n/a")
 
@@ -880,7 +911,9 @@ def build_text_snapshot(m: Dict[str, Any], profile: str) -> str:
         fib_g_btc = glyph(
             away_btc, THRESH["fib_warn"], THRESH["fib_flag"], False)
         lines.append("• BTC Fibonacci extension proximity: {} 1.272 @ {:.2f}% away (warn ≤ {:.1f}%, flag ≤ {:.1f}%)".format(
-            fib_g_btc, away_btc*100.0, THRESH["fib_warn"]*100.0, THRESH["fib_flag"]*100.0))
+            fib_g_btc, away_btc *
+            100.0, THRESH["fib_warn"] * 100.0, THRESH["fib_flag"] * 100.0
+        ))
     else:
         lines.append("• BTC Fibonacci extension proximity: 🟡 n/a")
 
@@ -889,7 +922,9 @@ def build_text_snapshot(m: Dict[str, Any], profile: str) -> str:
         fib_g_alt = glyph(
             away_alt, THRESH["fib_warn"], THRESH["fib_flag"], False)
         lines.append("• ALT basket Fibonacci proximity: {} 1.272 @ {:.2f}% away (warn ≤ {:.1f}%, flag ≤ {:.1f}%)".format(
-            fib_g_alt, away_alt*100.0, THRESH["fib_warn"]*100.0, THRESH["fib_flag"]*100.0))
+            fib_g_alt, away_alt *
+            100.0, THRESH["fib_warn"] * 100.0, THRESH["fib_flag"] * 100.0
+        ))
     else:
         lines.append("• ALT basket Fibonacci proximity: 🟡 n/a")
 
@@ -1022,7 +1057,7 @@ async def start_health_server():
     site = web.TCPSite(runner, host="0.0.0.0", port=8080)
     await site.start()
     log.info("Health server listening on :8080")
-    return runner, site
+    return runner
 
 # ----------------------------
 # Main
@@ -1033,6 +1068,7 @@ async def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN env var required")
 
+    # Telegram app
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Handlers
@@ -1044,9 +1080,15 @@ async def main():
     application.add_handler(CommandHandler("assess", cmd_assess))
 
     # Health server
-    runner, _site = await start_health_server()
+    runner = await start_health_server()
 
-    # Scheduler
+    # Initialize & delete webhook to enable polling
+    await application.initialize()
+    await application.bot.delete_webhook()
+    log.info("Deleted webhook (if any); switching to long polling.")
+    await application.start()
+
+    # Scheduler (after app is started)
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(lambda: asyncio.create_task(job_push_summary(application)),
                       trigger="cron", hour=SUMMARY_UTC_HOUR, minute=0)
@@ -1055,27 +1097,20 @@ async def main():
     scheduler.start()
     log.info("Scheduler started")
 
-    # ---- Start Telegram polling safely (v21 pattern) ----
-    await application.initialize()
-    # ensure we are in polling mode (remove any lingering webhook)
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Deleted webhook (if any); switching to long polling.")
-    except Exception as e:
-        log.warning("delete_webhook failed (continuing): %s", e)
-
-    await application.start()
-    if application.updater is None:
-        # Safety: in case PTB changes behavior, bail with a clear error
-        raise RuntimeError("Application.updater is None; cannot start polling")
-    await application.updater.start_polling()
+    # Start polling without taking over the loop
+    if application.updater:
+        await application.updater.start_polling()
     log.info("Application started; polling for updates.")
 
     try:
-        # Block here while the bot runs; shutdown handled below
-        await application.wait_until_closed()
+        while True:
+            await asyncio.sleep(3600)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
     finally:
-        await application.updater.stop()
+        # Graceful shutdown
+        if application.updater:
+            await application.updater.stop()
         await application.stop()
         await application.shutdown()
         scheduler.shutdown(wait=False)
