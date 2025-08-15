@@ -3,8 +3,6 @@ import os
 import asyncio
 import signal
 import math
-import time
-import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,9 +11,7 @@ from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Telegram
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update
 
 # Google Trends
@@ -69,11 +65,6 @@ def pretty_usd(x: Optional[float]) -> str:
 
 
 def flag_color(value: float, warn: float, flag: float, direction: str = "above") -> str:
-    """
-    direction = 'above' means risk increases as value goes up (>= warn / flag)
-    direction = 'below' means risk increases as value goes down (<= warn / flag)
-    returns "🟢"/"🟡"/"🔴"
-    """
     if math.isnan(value):
         return "🟡"
     if direction == "above":
@@ -84,7 +75,6 @@ def flag_color(value: float, warn: float, flag: float, direction: str = "above")
         else:
             return "🟢"
     else:
-        # risk if too low
         if value <= flag:
             return "🔴"
         elif value <= warn:
@@ -151,7 +141,6 @@ def stoch_rsi_kd(closes: List[float], rsi_period: int = 14, stoch_period: int = 
 
 
 def to_2w_series(ts: List[int], closes: List[float]) -> Tuple[List[int], List[float]]:
-    """Collapse weekly series into 2-week series by pairing sequential bars."""
     if len(closes) < 3:
         return ts, closes
     out_ts, out_cl = [], []
@@ -172,6 +161,13 @@ class DataClient:
     def __init__(self):
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(20.0, read=20.0, connect=15.0))
+
+    # <<< FIX: make this usable in "async with" >>>
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
 
     async def close(self):
         await self.http.aclose()
@@ -238,14 +234,11 @@ class DataClient:
             if not oi_js or not oi_js.get("data"):
                 return None
             row = oi_js["data"][0]
-            # open interest in coin units
             oi_ccy = safe_float(row.get("oiCcy"), float("nan"))
             if math.isnan(oi_ccy):
-                # fallback to contracts (rough)
                 oi = safe_float(row.get("oi"), float("nan"))
                 if math.isnan(oi):
                     return None
-                # Try to multiply by price directly
                 price = None
                 if last_js and last_js.get("data"):
                     price = safe_float(
@@ -264,10 +257,6 @@ class DataClient:
         return None
 
     async def okx_candles(self, inst_id: str, bar: str, limit: int) -> Tuple[List[int], List[float]]:
-        """
-        Returns (timestamps_ms asc, closes asc)
-        OKX returns newest-first; we’ll reverse.
-        """
         js = await self.okx_get("/api/v5/market/candles", {"instId": inst_id, "bar": bar, "limit": str(limit)})
         if not js or not js.get("data"):
             return [], []
@@ -280,7 +269,6 @@ class DataClient:
     # ------------- Google Trends -------------
     async def google_trends_score(self) -> Optional[float]:
         try:
-            # pytrends is sync; run in a thread so we don’t block.
             loop = asyncio.get_running_loop()
 
             def run():
@@ -290,7 +278,6 @@ class DataClient:
                 df = py.interest_over_time()
                 if df is None or df.empty:
                     return None
-                # last 7 days mean across three columns
                 tail = df.tail(7)[["crypto", "bitcoin", "ethereum"]]
                 return float(tail.mean().mean())
             return await loop.run_in_executor(None, run)
@@ -300,10 +287,6 @@ class DataClient:
 
     # ------------- Fear & Greed -------------
     async def fear_greed(self) -> Tuple[Optional[int], Optional[float], Optional[float], int, float]:
-        """
-        Returns: (today, ma14, ma30, greed_run_days, percent_greed30)
-        greed threshold: >=70
-        """
         today = None
         ma14 = None
         ma30 = None
@@ -319,8 +302,7 @@ class DataClient:
             r60 = await self.http.get("https://api.alternative.me/fng/?limit=60")
             r60.raise_for_status()
             j60 = r60.json()
-            vals = [int(x["value"])
-                    for x in j60.get("data", [])][::-1]  # oldest->newest
+            vals = [int(x["value"]) for x in j60.get("data", [])][::-1]
             if vals:
                 s = pd.Series(vals, dtype=float)
                 if len(s) >= 14:
@@ -329,8 +311,6 @@ class DataClient:
                     ma30 = float(s.rolling(30).mean().iloc[-1])
                     last30 = s.iloc[-30:]
                     greed_pct30 = float((last30 >= 70).mean() * 100.0)
-
-                # consecutive greed run (from end)
                 i = len(s) - 1
                 while i >= 0 and s.iloc[i] >= 70:
                     greed_run_days += 1
@@ -341,26 +321,19 @@ class DataClient:
 
     # ------------- CMC Total3 (optional) -------------
     async def cmc_total3(self) -> Optional[float]:
-        """
-        Returns Total3 market cap in USD if CMC_API_KEY present.
-        """
         api_key = os.getenv("CMC_API_KEY")
         if not api_key:
             return None
         try:
             headers = {"X-CMC_PRO_API_KEY": api_key}
-            # Global metrics with market cap details
             url = "https://pro-api.coinmarketcap.com/v1/global-metrics/quotes/latest"
             r = await self.http.get(url, headers=headers, params={})
             r.raise_for_status()
             data = r.json().get("data", {})
-            # CMC doesn't directly return Total3; approximate: TOTAL_MARKET_CAP - BTC_CAP - ETH_CAP
             total = safe_float(data.get("quote", {}).get(
                 "USD", {}).get("total_market_cap"), float("nan"))
-            btc_dominance = safe_float(
-                data.get("btc_dominance"), float("nan"))  # %
-            eth_dominance = safe_float(
-                data.get("eth_dominance"), float("nan"))  # %
+            btc_dominance = safe_float(data.get("btc_dominance"), float("nan"))
+            eth_dominance = safe_float(data.get("eth_dominance"), float("nan"))
             if not math.isnan(total) and not math.isnan(btc_dominance) and not math.isnan(eth_dominance):
                 btc_cap = total * (btc_dominance / 100.0)
                 eth_cap = total * (eth_dominance / 100.0)
@@ -381,12 +354,10 @@ FUNDING_INSTS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP",
 
 
 def profile_thresholds(profile: str) -> Dict[str, Any]:
-    # These thresholds tune how sensitive the flags are
     p = profile.lower().strip()
     if p not in {"conservative", "moderate", "aggressive"}:
         p = "moderate"
     scale = {"conservative": 0.9, "moderate": 1.0, "aggressive": 1.1}[p]
-    # interpret scale: conservative warns earlier (lower warn), aggressive warns later (higher warn)
     t = {
         "btc_dom_warn": 48.0 * (1/scale),
         "btc_dom_flag": 60.0 * (1/scale),
@@ -394,7 +365,7 @@ def profile_thresholds(profile: str) -> Dict[str, Any]:
         "ethbtc_flag": 0.090 * scale,
         "alt_btc_warn": 1.44 * scale,
         "alt_btc_flag": 1.80 * scale,
-        "funding_warn": 0.08 * scale * 100,  # percent
+        "funding_warn": 0.08 * scale * 100,
         "funding_flag": 0.10 * scale * 100,
         "oi_btc_warn": 16e9 * scale,
         "oi_btc_flag": 20e9 * scale,
@@ -418,10 +389,10 @@ def profile_thresholds(profile: str) -> Dict[str, Any]:
         "rsi_ethbtc2w_flag": 65.0 * scale,
         "rsi_alt2w_warn": 65.0 * scale,
         "rsi_alt2w_flag": 75.0 * scale,
-        "stoch_ob": 0.80,  # overbought threshold for Stoch RSI
+        "stoch_ob": 0.80,
         "fib_warn_pct": 3.0 / scale,
         "fib_flag_pct": 1.5 / scale,
-        "pi_close_pct": 3.0,  # within 3% is very close
+        "pi_close_pct": 3.0,
     }
     return t
 
@@ -429,7 +400,7 @@ def profile_thresholds(profile: str) -> Dict[str, Any]:
 async def gather_metrics(dc: DataClient, prof: str) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     t = profile_thresholds(prof)
 
-    # --- Market structure ---
+    # Market structure
     cg = await dc.coingecko_global()
     prices = await dc.coingecko_prices()
     btc_usd = prices.get("bitcoin", float("nan"))
@@ -444,15 +415,11 @@ async def gather_metrics(dc: DataClient, prof: str) -> Tuple[Dict[str, Any], Dic
             btc_dom = safe_float(
                 cg.get("market_cap_percentage", {}).get("btc"), float("nan"))
             if not math.isnan(btc_dom):
-                # Alt/BTC ratio = (100 - btc%) / btc%
                 alt_btc_ratio = (100.0 - btc_dom) / btc_dom
         except Exception:
             pass
 
-    # If CMC key present, we *could* refine alt_btc_ratio using Total3 / BTC cap, but we lack BTC cap from CMC here.
-    # Keeping the Coingecko-derived ratio which worked reliably for you.
-
-    # --- Funding basket + OI from OKX ---
+    # Funding basket + OI from OKX
     funding_rows: List[Tuple[str, Optional[float]]] = []
     funding_values: List[float] = []
     for inst in FUNDING_INSTS:
@@ -468,15 +435,14 @@ async def gather_metrics(dc: DataClient, prof: str) -> Tuple[Dict[str, Any], Dic
     oi_btc_usd = await dc.okx_open_interest_usd("BTC-USDT-SWAP")
     oi_eth_usd = await dc.okx_open_interest_usd("ETH-USDT-SWAP")
 
-    # --- Google Trends ---
+    # Google Trends
     trends = await dc.google_trends_score()
 
-    # --- Fear & Greed ---
+    # Fear & Greed
     fng_today, fng_ma14, fng_ma30, fng_run_days, fng_pct30 = await dc.fear_greed()
 
-    # --- Pi Cycle Top proximity (OKX daily) ---
+    # Pi Cycle Top proximity (OKX daily)
     ts_d, cl_d = await dc.okx_candles("BTC-USDT", "1D", 500)
-    # percent distance between 111DMA and 2x350DMA (lower = closer)
     pi_prox = None
     if len(cl_d) >= 350:
         c = pd.Series(cl_d, dtype=float)
@@ -488,36 +454,30 @@ async def gather_metrics(dc: DataClient, prof: str) -> Tuple[Dict[str, Any], Dic
             dist_pct = abs(v111 - v2x350) / v2x350 * 100.0
             pi_prox = dist_pct
 
-    # --- Weekly data for RSI/Stoch/Fibs ---
-    # BTC 1W (and later collapsed to 2W)
+    # Weekly data for RSI/Stoch/Fibs
     ts_w_btc, cl_w_btc = await dc.okx_candles("BTC-USDT", "1W", 400)
     ts_w_ethbtc, cl_w_ethbtc = await dc.okx_candles("ETH-BTC", "1W", 400)
 
-    # ALT basket 1W
     alt_closes_map: Dict[str, List[float]] = {}
-    for inst in ALT_BASKET:
+    for inst in ["SOL-USDT", "XRP-USDT", "DOGE-USDT", "ADA-USDT", "BNB-USDT", "AVAX-USDT", "LINK-USDT", "MATIC-USDT"]:
         _, cl = await dc.okx_candles(inst, "1W", 400)
         if cl:
             alt_closes_map[inst] = cl
 
-    # 2-Week series (close-only)
     def to_2w(closes: List[float]) -> List[float]:
         _, cc = to_2w_series(list(range(len(closes))), closes)
         return cc
 
-    # BTC 2W RSI / Stoch with MA on RSI
     btc_2w = to_2w(cl_w_btc) if cl_w_btc else []
     btc_rsi2w = rsi_from_closes(btc_2w, period=14) if btc_2w else []
     btc_rsi2w_ma = sma(btc_rsi2w, period=9) if btc_rsi2w else []
     btc_k2w, btc_d2w = stoch_rsi_kd(
-        btc_2w, rsi_period=14, stoch_period=14, smooth_k=3, smooth_d=3) if btc_2w else ([], [])
+        btc_2w, 14, 14, 3, 3) if btc_2w else ([], [])
 
-    # ETH/BTC 2W RSI (this is a relative momentum proxy)
     ethbtc_2w = to_2w(cl_w_ethbtc) if cl_w_ethbtc else []
     ethbtc_rsi2w = rsi_from_closes(ethbtc_2w, period=14) if ethbtc_2w else []
     ethbtc_rsi2w_ma = sma(ethbtc_rsi2w, period=9) if ethbtc_rsi2w else []
 
-    # ALT basket 2W RSI/Stoch + simple fib proximity aggregation
     alt_rsi_vals: List[float] = []
     alt_rsi_ma_vals: List[float] = []
     alt_k_vals: List[float] = []
@@ -530,13 +490,10 @@ async def gather_metrics(dc: DataClient, prof: str) -> Tuple[Dict[str, Any], Dic
             r = rsi_from_closes(two_w, 14)
             rma = sma(r, 9)
             k, d = stoch_rsi_kd(two_w, 14, 14, 3, 3)
-
             alt_rsi_vals.append(float(r[-1]))
             alt_rsi_ma_vals.append(float(rma[-1]))
             alt_k_vals.append(float(k[-1]))
             alt_d_vals.append(float(d[-1]))
-
-        # Fib proximity on 1W for each ALT, then average
         if len(cl) >= 60:
             s = pd.Series(cl, dtype=float)
             lo = float(s[-60:].min())
@@ -555,7 +512,6 @@ async def gather_metrics(dc: DataClient, prof: str) -> Tuple[Dict[str, Any], Dic
     alt_fib_prox = float(np.median(alt_fib_prox_vals)
                          ) if alt_fib_prox_vals else float("nan")
 
-    # BTC weekly Fib proximity (reference window 100w)
     btc_fib_prox = float("nan")
     if len(cl_w_btc) >= 100:
         s = pd.Series(cl_w_btc, dtype=float)
@@ -566,7 +522,6 @@ async def gather_metrics(dc: DataClient, prof: str) -> Tuple[Dict[str, Any], Dic
         fib1272 = hi + 1.272 * rng
         btc_fib_prox = abs(last - fib1272) / fib1272 * 100.0
 
-    # Build metric dicts
     m: Dict[str, Any] = dict(
         btc_dom=btc_dom,
         eth_btc=eth_btc,
@@ -600,10 +555,7 @@ async def gather_metrics(dc: DataClient, prof: str) -> Tuple[Dict[str, Any], Dic
         pct30=fng_pct30,
     )
 
-    aux: Dict[str, Any] = {
-        "funding_rows": funding_rows,
-    }
-
+    aux: Dict[str, Any] = {"funding_rows": funding_rows}
     return m, f, aux
 
 # --------------------------------------------------------------------------------------
@@ -621,7 +573,6 @@ def score_linear(x: float, warn: float, flag: float, direction: str = "above") -
             return 100.0
         return 100.0 * (x - warn) / (flag - warn)
     else:
-        # risk increases as x goes DOWN toward/under warn/flag
         if x >= warn:
             return 0.0
         if x <= flag:
@@ -630,16 +581,13 @@ def score_linear(x: float, warn: float, flag: float, direction: str = "above") -
 
 
 def build_composite(m: Dict[str, Any], f: Dict[str, Any], t: Dict[str, Any]) -> Tuple[int, List[Tuple[str, int]]]:
-    # Individual subscores
     subs: Dict[str, float] = {}
 
-    # Structure
     subs["Alt vs BTC cap"] = score_linear(m.get("altcap_btc_ratio", float(
         "nan")), t["alt_btc_warn"], t["alt_btc_flag"], "above")
     subs["ETH/BTC level"] = score_linear(
         m.get("eth_btc", float("nan")), t["ethbtc_warn"], t["ethbtc_flag"], "above")
 
-    # Derivs
     subs["Funding"] = score_linear(m.get("funding_max", float(
         "nan")), t["funding_warn"], t["funding_flag"], "above")
     subs["BTC OI"] = score_linear(m.get("oi_btc", float(
@@ -647,7 +595,6 @@ def build_composite(m: Dict[str, Any], f: Dict[str, Any], t: Dict[str, Any]) -> 
     subs["ETH OI"] = score_linear(m.get("oi_eth", float(
         "nan")), t["oi_eth_warn"], t["oi_eth_flag"], "above")
 
-    # Sentiment
     subs["Trends"] = score_linear(m.get("trends", float(
         "nan")), t["trends_warn"], t["trends_flag"], "above")
     subs["F&G today"] = score_linear(
@@ -656,28 +603,24 @@ def build_composite(m: Dict[str, Any], f: Dict[str, Any], t: Dict[str, Any]) -> 
         "nan")), t["fng14_warn"], t["fng14_flag"], "above")
     subs["F&G 30d"] = score_linear(float(f.get("ma30") or float(
         "nan")), t["fng30_warn"], t["fng30_flag"], "above")
-    # Persistence: days & pct both matter; take max
+
     day_score = score_linear(float(f.get("run_days", 0)), float(
         t["fng_days_warn"]), float(t["fng_days_flag"]), "above")
     pct_score = score_linear(float(f.get("pct30") or float("nan")), float(
         t["fng_pct30_warn"]), float(t["fng_pct30_flag"]), "above")
     subs["F&G persist"] = max(day_score, pct_score)
 
-    # Pi Cycle proximity (closer distance => higher risk)
     pi = m.get("pi_prox")
     if pi is None or math.isnan(pi):
         subs["Pi Cycle prox"] = 0.0
     else:
-        # 0% distance => 100 risk, 3% distance => 0 risk
         subs["Pi Cycle prox"] = clamp(
             100.0 * (1.0 - (pi / t["pi_close_pct"])), 0.0, 100.0)
 
-    # Momentum (2W)
     subs["BTC RSI (2W)"] = score_linear(m.get("btc_rsi2w", float(
         "nan")), t["rsi_btc2w_warn"], t["rsi_btc2w_flag"], "above")
     subs["ETH/BTC RSI (2W)"] = score_linear(m.get("ethbtc_rsi2w", float("nan")),
                                             t["rsi_ethbtc2w_warn"], t["rsi_ethbtc2w_flag"], "above")
-    # If RSI < its MA, add a small penalty (10 points)
     if not math.isnan(m.get("btc_rsi2w", float("nan"))) and not math.isnan(m.get("btc_rsi2w_ma", float("nan"))):
         if m["btc_rsi2w"] < m["btc_rsi2w_ma"]:
             subs["BTC RSI (2W)"] = clamp(
@@ -687,7 +630,6 @@ def build_composite(m: Dict[str, Any], f: Dict[str, Any], t: Dict[str, Any]) -> 
             subs["ETH/BTC RSI (2W)"] = clamp(subs["ETH/BTC RSI (2W)"] +
                                              10.0, 0.0, 100.0)
 
-    # Stoch overbought + bearish cross risk
     stoch_ob = 0.80
     st_btc = 0.0
     if not math.isnan(m.get("btc_k2w", float("nan"))) and not math.isnan(m.get("btc_d2w", float("nan"))):
@@ -709,14 +651,12 @@ def build_composite(m: Dict[str, Any], f: Dict[str, Any], t: Dict[str, Any]) -> 
                 st_alt = 100.0
     subs["ALT Stoch (2W)"] = st_alt
 
-    # Fib proximity (closer => higher risk)
     for name, prox in [("BTC Fib 1.272", m.get("btc_fib_prox")), ("ALT Fib 1.272", m.get("alt_fib_prox"))]:
         if prox is None or math.isnan(prox):
             subs[name] = 0.0
         else:
             warn = float(t["fib_warn_pct"])
             flag = float(t["fib_flag_pct"])
-            # risk rises as prox falls (below thresholds)
             if prox >= warn:
                 subs[name] = 0.0
             elif prox <= flag:
@@ -724,7 +664,6 @@ def build_composite(m: Dict[str, Any], f: Dict[str, Any], t: Dict[str, Any]) -> 
             else:
                 subs[name] = 100.0 * (warn - prox) / (warn - flag)
 
-    # ALT RSI (2W)
     subs["ALT RSI (2W)"] = score_linear(m.get("alt_rsi2w", float(
         "nan")), t["rsi_alt2w_warn"], t["rsi_alt2w_flag"], "above")
     if not math.isnan(m.get("alt_rsi2w", float("nan"))) and not math.isnan(m.get("alt_rsi2w_ma", float("nan"))):
@@ -732,13 +671,9 @@ def build_composite(m: Dict[str, Any], f: Dict[str, Any], t: Dict[str, Any]) -> 
             subs["ALT RSI (2W)"] = clamp(
                 subs["ALT RSI (2W)"] + 10.0, 0.0, 100.0)
 
-    # Equal weights across blocks (already roughly balanced); compute mean
     total = int(round(float(np.mean(list(subs.values()))) if subs else 0.0))
-
-    # Top 5 contributors
     sorted_items = sorted(subs.items(), key=lambda kv: kv[1], reverse=True)
     top5 = [(k, int(round(v))) for k, v in sorted_items[:5]]
-
     return total, top5
 
 # --------------------------------------------------------------------------------------
@@ -749,7 +684,6 @@ def build_composite(m: Dict[str, Any], f: Dict[str, Any], t: Dict[str, Any]) -> 
 def format_snapshot(ts_iso: str, profile: str, m: Dict[str, Any], f: Dict[str, Any], aux: Dict[str, Any]) -> str:
     t = profile_thresholds(profile)
 
-    # Colors
     c_btc_dom = flag_color(m.get("btc_dom", float("nan")),
                            t["btc_dom_warn"], t["btc_dom_flag"], "above")
     c_ethbtc = flag_color(m.get("eth_btc", float("nan")),
@@ -776,7 +710,6 @@ def format_snapshot(ts_iso: str, profile: str, m: Dict[str, Any], f: Dict[str, A
                          t["fng14_warn"], t["fng14_flag"], "above")
     c_fng30 = flag_color(float(f.get("ma30") or float("nan")),
                          t["fng30_warn"], t["fng30_flag"], "above")
-    # Persistence color: if either days or pct triggers, use worse
     days_color = flag_color(float(f.get("run_days", 0)), float(
         t["fng_days_warn"]), float(t["fng_days_flag"]), "above")
     pct_color = flag_color(float(f.get("pct30") or float("nan")), float(
@@ -784,7 +717,6 @@ def format_snapshot(ts_iso: str, profile: str, m: Dict[str, Any], f: Dict[str, A
     c_persist = "🔴" if "🔴" in (days_color, pct_color) else (
         "🟡" if "🟡" in (days_color, pct_color) else "🟢")
 
-    # Momentum colors (2W)
     c_rsi_btc = flag_color(m.get("btc_rsi2w", float("nan")),
                            t["rsi_btc2w_warn"], t["rsi_btc2w_flag"], "above")
     c_rsi_ethbtc = flag_color(m.get("ethbtc_rsi2w", float(
@@ -792,13 +724,11 @@ def format_snapshot(ts_iso: str, profile: str, m: Dict[str, Any], f: Dict[str, A
     c_rsi_alt = flag_color(m.get("alt_rsi2w", float("nan")),
                            t["rsi_alt2w_warn"], t["rsi_alt2w_flag"], "above")
 
-    # Stoch indicators shown without strict color other than overbought/cross description
     def stoch_text(k: float, d: float) -> str:
         if math.isnan(k) or math.isnan(d):
             return "n/a"
         return f"{k:.2f}/{d:.2f}"
 
-    # Fib colors (closer to extensions => higher risk so reverse direction)
     def fib_color(px: Optional[float]) -> str:
         if px is None or math.isnan(px):
             return "🟡"
@@ -808,11 +738,9 @@ def format_snapshot(ts_iso: str, profile: str, m: Dict[str, Any], f: Dict[str, A
             return "🟡"
         return "🟢"
 
-    # Pi Cycle proximity
     pi_txt = "n/a"
     if m.get("pi_prox") is not None and not math.isnan(m.get("pi_prox")):
         pi_txt = f"{m['pi_prox']:.2f}% of trigger (100% = cross)"
-    c_header = []
 
     lines: List[str] = []
     lines.append(f"📊 Crypto Market Snapshot — {ts_iso}")
@@ -831,20 +759,17 @@ def format_snapshot(ts_iso: str, profile: str, m: Dict[str, Any], f: Dict[str, A
 
     lines.append("")
     lines.append("Derivatives")
-    # Funding basket summary
     fmax = m.get("funding_max", float("nan"))
     fmed = m.get("funding_median", float("nan"))
     basket_names = [s for (s, _) in aux.get("funding_rows", [])]
     lines.append(
         f"• Funding (basket: {', '.join(basket_names)}) — max: {c_fmax} {pretty_pct(fmax)} | median: {c_fmed} {pretty_pct(fmed)}  (warn ≥ {t['funding_warn']:.3f}%, flag ≥ {t['funding_flag']:.3f}%)")
-    # Show top-3 extremes
     tops = sorted(aux.get("funding_rows", []), key=lambda kv: (
         kv[1] if kv[1] is not None else -1e9), reverse=True)[:3]
     tops_s = ", ".join(
         [f"{n} {pretty_pct(v)}" for (n, v) in tops if v is not None])
     if tops_s:
         lines.append(f"  Top-3 funding extremes: {tops_s}")
-    # OI
     lines.append(
         f"• Bitcoin open interest (USD): {c_oibtc} {pretty_usd(m.get('oi_btc'))}  (warn ≥ {pretty_usd(t['oi_btc_warn'])}, flag ≥ {pretty_usd(t['oi_btc_flag'])})")
     lines.append(
@@ -873,32 +798,28 @@ def format_snapshot(ts_iso: str, profile: str, m: Dict[str, Any], f: Dict[str, A
 
     lines.append("")
     lines.append("Momentum (2W) & Extensions (1W)")
-    # BTC RSI (2W)
     if not math.isnan(m.get("btc_rsi2w", float("nan"))) and not math.isnan(m.get("btc_rsi2w_ma", float("nan"))):
         lines.append(
             f"• BTC RSI (2W): {c_rsi_btc} {m['btc_rsi2w']:.1f} (MA {m['btc_rsi2w_ma']:.1f}) (warn ≥ {t['rsi_btc2w_warn']:.1f}, flag ≥ {t['rsi_btc2w_flag']:.1f})")
     else:
         lines.append("• BTC RSI (2W): 🟡 n/a")
-    # ETH/BTC RSI (2W)
     if not math.isnan(m.get("ethbtc_rsi2w", float("nan"))) and not math.isnan(m.get("ethbtc_rsi2w_ma", float("nan"))):
         lines.append(
             f"• ETH/BTC RSI (2W): {c_rsi_ethbtc} {m['ethbtc_rsi2w']:.1f} (MA {m['ethbtc_rsi2w_ma']:.1f}) (warn ≥ {t['rsi_ethbtc2w_warn']:.1f}, flag ≥ {t['rsi_ethbtc2w_flag']:.1f})")
     else:
         lines.append("• ETH/BTC RSI (2W): 🟡 n/a")
-    # ALT basket RSI (2W)
     if not math.isnan(m.get("alt_rsi2w", float("nan"))) and not math.isnan(m.get("alt_rsi2w_ma", float("nan"))):
         lines.append(
             f"• ALT basket (equal-weight) RSI (2W): {c_rsi_alt} {m['alt_rsi2w']:.1f} (MA {m['alt_rsi2w_ma']:.1f}) (warn ≥ {t['rsi_alt2w_warn']:.1f}, flag ≥ {t['rsi_alt2w_flag']:.1f})")
     else:
         lines.append("• ALT basket (equal-weight) RSI (2W): 🟡 n/a")
 
-    # Stoch RSI (2W)
+    def stoch_text2(k, d): return stoch_text(k, d)
     lines.append(
-        f"• BTC Stoch RSI (2W) K/D: {stoch_text(m.get('btc_k2w', float('nan')), m.get('btc_d2w', float('nan')))} (overbought ≥ 0.80; red = bearish cross from OB)")
+        f"• BTC Stoch RSI (2W) K/D: {stoch_text2(m.get('btc_k2w', float('nan')), m.get('btc_d2w', float('nan')))} (overbought ≥ 0.80; red = bearish cross from OB)")
     lines.append(
-        f"• ALT basket Stoch RSI (2W) K/D: {stoch_text(m.get('alt_k2w', float('nan')), m.get('alt_d2w', float('nan')))} (overbought ≥ 0.80; red = bearish cross from OB)")
+        f"• ALT basket Stoch RSI (2W) K/D: {stoch_text2(m.get('alt_k2w', float('nan')), m.get('alt_d2w', float('nan')))} (overbought ≥ 0.80; red = bearish cross from OB)")
 
-    # Fibs
     if not math.isnan(m.get("btc_fib_prox", float("nan"))):
         lines.append(
             f"• BTC Fibonacci extension proximity: {fib_color(m.get('btc_fib_prox'))} 1.272 @ {m['btc_fib_prox']:.2f}% away (warn ≤ {t['fib_warn_pct']:.1f}%, flag ≤ {t['fib_flag_pct']:.1f}%)")
@@ -934,21 +855,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def build_and_send_snapshot(app: Application, chat_id: int, profile: str) -> None:
-    async with DataClient() as dc:  # type: ignore
+    async with DataClient() as dc:  # now supported
         try:
             m, f, aux = await gather_metrics(dc, profile)
             t = profile_thresholds(profile)
-            # Composite
             total, top5 = build_composite(m, f, t)
-            header = [
-                f"📊 Crypto Market Snapshot — {pd.Timestamp.utcnow().isoformat()}Z",
-                f"Profile: {profile}",
-                ""
-            ]
             body = format_snapshot(
-                pd.Timestamp.utcnow().isoformat(), profile, m, f, aux)
+                pd.Timestamp.utcnow().isoformat() + "Z", profile, m, f, aux)
 
-            # Composite block
             comp_lines = []
             comp_lines.append("")
             comp_lines.append("Alt-Top Certainty (Composite)")
@@ -961,7 +875,6 @@ async def build_and_send_snapshot(app: Application, chat_id: int, profile: str) 
                         f"  • {name}: {traffic_from_score(sc)} {sc}/100")
 
             text = "\n".join((body, "\n".join(comp_lines)))
-
             for chunk in split_long_message(text):
                 await app.bot.send_message(chat_id=chat_id, text=chunk)
         except Exception as e:
@@ -989,7 +902,6 @@ async def cmd_assess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # --------------------------------------------------------------------------------------
 # Push jobs (scheduler)
 # --------------------------------------------------------------------------------------
-# set this to auto-push somewhere
 DAILY_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 
 
@@ -999,17 +911,20 @@ async def push_summary(app: Application) -> None:
     await build_and_send_snapshot(app, DAILY_CHAT_ID, DEFAULT_PROFILE)
 
 
+async def contextless_send(app: Application, chat_id: int, text: str) -> None:
+    for chunk in split_long_message(text):
+        await app.bot.send_message(chat_id=chat_id, text=chunk)
+
+
 async def push_alerts(app: Application) -> None:
-    # Light check; if any hard flags (e.g., F&G persist, Pi very close), send a compact ping
     if DAILY_CHAT_ID == 0:
         return
-    async with DataClient() as dc:  # type: ignore
+    async with DataClient() as dc:
         try:
             m, f, aux = await gather_metrics(dc, DEFAULT_PROFILE)
             t = profile_thresholds(DEFAULT_PROFILE)
             total, top5 = build_composite(m, f, t)
             flags: List[str] = []
-
             if f.get("today") is not None and f["today"] >= t["fng_flag"]:
                 flags.append("Fear & Greed (today) in Greed")
             if f.get("ma30") is not None and f["ma30"] >= t["fng30_flag"]:
@@ -1034,11 +949,6 @@ async def push_alerts(app: Application) -> None:
         except Exception as e:
             log.warning("push_alerts failed: %s", e)
 
-
-async def contextless_send(app: Application, chat_id: int, text: str) -> None:
-    for chunk in split_long_message(text):
-        await app.bot.send_message(chat_id=chat_id, text=chunk)
-
 # --------------------------------------------------------------------------------------
 # Health server
 # --------------------------------------------------------------------------------------
@@ -1059,7 +969,15 @@ async def start_health_server(host="0.0.0.0", port=8080):
     return runner
 
 # --------------------------------------------------------------------------------------
-# Main (single event loop; no run_polling)
+# Error handler (avoid noisy stack traces from Telegram)
+# --------------------------------------------------------------------------------------
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Telegram error: %s", context.error)
+
+# --------------------------------------------------------------------------------------
+# Main (single event loop; polling)
 # --------------------------------------------------------------------------------------
 
 
@@ -1070,22 +988,19 @@ async def main():
 
     app = Application.builder().token(token).build()
 
-    # Handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("assess", cmd_assess))
+    app.add_error_handler(on_error)
 
-    # Health server
     port = int(os.getenv("PORT", "8080"))
     health_runner = await start_health_server("0.0.0.0", port)
 
-    # Start Telegram (no run_polling)
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
     log.info("Bot running. Press Ctrl+C to exit.")
 
-    # Scheduler
     loop = asyncio.get_running_loop()
     scheduler = AsyncIOScheduler(event_loop=loop, timezone="UTC")
     push_hour = int(os.getenv("PUSH_HOUR_UTC", "15"))
@@ -1097,7 +1012,6 @@ async def main():
     scheduler.start()
     log.info("Scheduler started")
 
-    # Graceful shutdown
     stop_event = asyncio.Event()
 
     def _stop():
@@ -1113,7 +1027,6 @@ async def main():
 
     await stop_event.wait()
 
-    # Teardown
     scheduler.shutdown(wait=False)
     await app.updater.stop()
     await app.stop()
