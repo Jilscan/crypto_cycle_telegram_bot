@@ -1,1118 +1,995 @@
-from aiohttp import web
+# main.py
 import os
 import asyncio
-import logging
 import json
+import math
+import logging
 from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, List, Tuple, Optional
 
 import httpx
-import yaml
+import pandas as pd
+import numpy as np
+
+from pytrends.request import TrendReq
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from tzlocal import get_localzone
+from aiohttp import web
+
 from telegram import Update
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, ContextTypes
+    Application, ApplicationBuilder, CommandHandler,
+    ContextTypes
 )
 
-import math
-import statistics
-
-# Optional heavy deps (pytrends/pandas/numpy) are available per requirements.txt
-from pytrends.request import TrendReq
-
-# ---------- Logging ----------
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(levelname)s:%(name)s:%(message)s"
-)
+# ------------------------- Logging -------------------------
+logging.basicConfig(level=logging.INFO,
+                    format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("crypto-cycle-bot")
 
-# ---------- Config ----------
-DEFAULT_CFG = {
-    "risk_profile": os.getenv("RISK_PROFILE", "moderate"),
-    "daily_push_utc_hhmm": "14:00",     # once-a-day update (UTC)
-    "alerts_every_minutes": 15,         # intraday checks
-    "funding_symbols": ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP", "DOGE-USDT-SWAP"],
-    "alt_basket": ["SOL-USDT", "XRP-USDT", "DOGE-USDT", "ADA-USDT", "BNB-USDT", "AVAX-USDT", "LINK-USDT", "MATIC-USDT"],
-    "telegram": {
-        "token": os.getenv("TELEGRAM_TOKEN", ""),
-        "admin_chat_id": os.getenv("ADMIN_CHAT_ID", "")  # for scheduled pushes
-    },
+# ------------------------- Config --------------------------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+DEFAULT_RISK = os.getenv("DEFAULT_RISK", "moderate").strip().lower()
+PUSH_HOUR_UTC = int(os.getenv("PUSH_HOUR_UTC", "15")
+                    )        # daily snapshot push time
+# alerts check interval (minutes)
+ALERT_MINUTES = int(os.getenv("ALERT_EVERY_MIN", "15"))
+CMC_API_KEY = os.getenv("CMC_API_KEY", "").strip()
+
+# OKX instruments
+OKX_FUTS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP",
+            "SOL-USDT-SWAP", "XRP-USDT-SWAP", "DOGE-USDT-SWAP"]
+OKX_SPOT_ETHBTC = "ETH-BTC"
+OKX_SPOT_BTCUSDT = "BTC-USDT"
+
+# Alt basket (equal-weight momentum “index” on weekly candles)
+ALT_BASKET = ["ADA-USDT", "BNB-USDT", "AVAX-USDT", "LINK-USDT",
+              "MATIC-USDT", "SOL-USDT", "XRP-USDT", "DOGE-USDT"]
+
+# Subscribers kept in-memory (you can hardcode a chat ID if you prefer)
+SUBSCRIBERS: set[int] = set()
+
+# Risk profiles tweak thresholds (lower = more cautious)
+RISK_MULT = {
+    "conservative": 0.9,
+    "moderate": 1.0,
+    "aggressive": 1.15
 }
 
-
-def load_config():
-    cfg_path = os.path.join(os.getcwd(), "config.yml")
-    cfg = {}
-    if os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r") as f:
-                cfg = yaml.safe_load(f) or {}
-        except Exception as e:
-            log.warning("Failed to read config.yml: %s", e)
-    # merge defaults
-
-    def deepmerge(a, b):
-        for k, v in b.items():
-            if isinstance(v, dict):
-                a[k] = deepmerge(a.get(k, {}) if isinstance(
-                    a.get(k), dict) else {}, v)
-            else:
-                a[k] = a.get(k, v) if a.get(k) not in (None, "") else v
-        return a
-    merged = deepmerge(cfg, DEFAULT_CFG)
-    return merged
+# --------------------- Utility & TA ------------------------
 
 
-CFG = load_config()
-if CFG["telegram"]["token"]:
-    log.info("Loaded configuration from config.yml")
-else:
-    log.warning("TELEGRAM_TOKEN missing. Set env or config.yml.")
-
-# ---------- Small utils ----------
-
-
-def pct(x):
-    try:
-        return f"{x:.2f}%"
-    except Exception:
-        return "n/a"
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = (delta.clip(lower=0)).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / (loss.replace(0, np.nan))
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(0)
 
 
-def usd(x):
-    try:
-        return f"${x:,.0f}"
-    except Exception:
-        return "n/a"
+def stoch_rsi(rsi_series: pd.Series, period: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> Tuple[pd.Series, pd.Series]:
+    min_rsi = rsi_series.rolling(period).min()
+    max_rsi = rsi_series.rolling(period).max()
+    stoch = (rsi_series - min_rsi) / (max_rsi - min_rsi + 1e-9)
+    k = stoch.rolling(smooth_k).mean()
+    d = k.rolling(smooth_d).mean()
+    return k.fillna(0), d.fillna(0)
 
 
-def green_yellow_red(val, warn, flag, reverse=False):
-    """3-color traffic light. reverse=True makes lower=red, higher=green."""
-    if val is None:
-        return "🟡"
-    if reverse:
-        # lower worse
-        if val <= flag:
-            return "🔴"
-        if val <= warn:
-            return "🟡"
-        return "🟢"
+def two_week_downsample(weekly_close: pd.Series) -> pd.Series:
+    # weekly_close indexed ascending; group into 2-week blocks
+    idx = np.arange(len(weekly_close)) // 2
+    close_2w = weekly_close.groupby(idx).last()
+    close_2w.index = range(len(close_2w))
+    return close_2w
+
+
+def fib_extension_proximity(close_series: pd.Series, lookback_weeks: int = 52) -> Tuple[float, float]:
+    # distance to 1.272 extension above the most recent swing range
+    s = close_series.dropna()
+    if len(s) < lookback_weeks + 5:
+        return (float("nan"), float("nan"))
+    s_win = s[-lookback_weeks:]
+    lo = float(s_win.min())
+    hi = float(s_win.max())
+    if hi <= 0 or hi == lo:
+        return (float("nan"), float("nan"))
+    ext_1272 = hi + 0.272 * (hi - lo)
+    last = float(s.iloc[-1])
+    pct_away = (ext_1272 - last) / ext_1272 * 100.0
+    return ext_1272, pct_away
+
+
+def ema(values: pd.Series, span: int) -> pd.Series:
+    return values.ewm(span=span, adjust=False).mean()
+
+
+def tri_flag(value: Optional[float], warn: float, flag: float, higher_is_risk: bool = True) -> Tuple[str, str]:
+    """
+    Returns (emoji, band) where band in {"green","yellow","red"} based on thresholds.
+    If higher_is_risk is True: value >= flag -> red, >= warn -> yellow else green.
+    If higher_is_risk is False: value <= flag -> red, <= warn -> yellow else green.
+    """
+    if value is None or math.isnan(value):
+        return "⚪", "na"
+    v = float(value)
+    if higher_is_risk:
+        if v >= flag:
+            return "🔴", "red"
+        if v >= warn:
+            return "🟡", "yellow"
+        return "🟢", "green"
     else:
-        if val >= flag:
-            return "🔴"
-        if val >= warn:
-            return "🟡"
-        return "🟢"
+        if v <= flag:
+            return "🔴", "red"
+        if v <= warn:
+            return "🟡", "yellow"
+        return "🟢", "green"
 
 
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
+def color_dot(band: str) -> str:
+    return {"red": "🔴", "yellow": "🟡", "green": "🟢"}.get(band, "⚪")
 
 
-def safe_float(x):
+def pct(x: Optional[float], digits: int = 2) -> str:
+    if x is None or math.isnan(x):
+        return "n/a"
+    return f"{x:.{digits}f}%"
+
+
+def fmt_money(x: Optional[float]) -> str:
+    if x is None or math.isnan(x):
+        return "n/a"
+    # compact USD
+    absx = abs(x)
+    if absx >= 1e12:
+        return f"${x/1e12:.2f}T"
+    if absx >= 1e9:
+        return f"${x/1e9:.2f}B"
+    if absx >= 1e6:
+        return f"${x/1e6:.2f}M"
+    return f"${x:,.0f}"
+
+
+def safe_float(x, default: Optional[float] = None) -> Optional[float]:
     try:
         return float(x)
     except Exception:
-        return None
+        return default
 
-# ---------- HTTP/Data client ----------
+# ---------------------- HTTP Data Client -------------------
 
 
 class DataClient:
-    def __init__(self, timeout=15.0):
-        self.client = httpx.AsyncClient(timeout=timeout, headers={
-                                        "User-Agent": "cc-bot/1.0"})
-        self.trends = TrendReq(hl="en-US", tz=0)
-        self.cmc_key = os.getenv("CMC_API_KEY", "").strip()
+    def __init__(self):
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0, connect=10.0))
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.client.aclose()
 
     async def close(self):
         await self.client.aclose()
 
-    # ---------- Coingecko (global + simple price) ----------
-    async def coingecko_global(self):
-        try:
-            r = await self.client.get("https://api.coingecko.com/api/v3/global")
-            r.raise_for_status()
-            return r.json().get("data", {})
-        except Exception as e:
-            log.warning("coingecko_global failed: %s", e)
-            return {}
+    # ---- Coingecko lightweight
+    async def cg_global(self) -> Dict[str, Any]:
+        r = await self.client.get("https://api.coingecko.com/api/v3/global")
+        r.raise_for_status()
+        return r.json()["data"]
 
-    async def cg_simple_price(self, ids=("bitcoin", "ethereum"), vs="usd"):
-        try:
-            params = {"ids": ",".join(ids), "vs_currencies": vs}
-            r = await self.client.get("https://api.coingecko.com/api/v3/simple/price", params=params)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            log.warning("cg_simple_price failed: %s", e)
-            return {}
+    # ---- CoinMarketCap optional
+    async def cmc_global(self) -> Optional[Dict[str, Any]]:
+        if not CMC_API_KEY:
+            return None
+        headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
+        url = "https://pro-api.coinmarketcap.com/v1/global-metrics/quotes/latest"
+        r = await self.client.get(url, headers=headers)
+        if r.status_code != 200:
+            return None
+        return r.json()["data"]
 
-    # ---------- OKX funding, ticker, OI, candles ----------
-    async def okx_funding_rate(self, inst_id):
+    # ---- OKX helpers
+    async def okx_get(self, path: str, params: Dict[str, str]) -> Dict[str, Any]:
+        url = f"https://www.okx.com{path}"
+        r = await self.client.get(url, params=params)
+        r.raise_for_status()
+        js = r.json()
+        if js.get("code") != "0":
+            raise RuntimeError(f"OKX error: {js.get('msg')}")
+        return js
+
+    async def okx_funding(self, instId: str) -> Optional[float]:
         try:
-            r = await self.client.get("https://www.okx.com/api/v5/public/funding-rate", params={"instId": inst_id})
-            r.raise_for_status()
-            data = r.json().get("data") or []
+            js = await self.okx_get("/api/v5/public/funding-rate", {"instId": instId})
+            data = js.get("data", [])
             if not data:
                 return None
-            fr = safe_float(data[0].get("fundingRate"))
-            return fr  # per 8h (decimal), e.g. 0.0001 = 0.01%
+            return safe_float(data[0].get("fundingRate"))
         except Exception as e:
-            log.warning("okx_funding_rate %s failed: %s", inst_id, e)
+            log.warning("funding %s failed: %s", instId, e)
             return None
 
-    async def okx_ticker_last(self, inst_id):
+    async def okx_ticker(self, instId: str) -> Optional[Dict[str, Any]]:
         try:
-            r = await self.client.get("https://www.okx.com/api/v5/market/ticker", params={"instId": inst_id})
-            r.raise_for_status()
-            data = r.json().get("data") or []
+            js = await self.okx_get("/api/v5/market/ticker", {"instId": instId})
+            data = js.get("data", [])
+            return data[0] if data else None
+        except Exception as e:
+            log.warning("ticker %s failed: %s", instId, e)
+            return None
+
+    async def okx_oi_usd(self, instId: str) -> Optional[float]:
+        try:
+            js = await self.okx_get("/api/v5/public/open-interest", {"instId": instId, "instType": "SWAP"})
+            data = js.get("data", [])
             if not data:
                 return None
-            last = safe_float(data[0].get("last"))
-            return last
+            row = data[0]
+            # Prefer oiCcy (base currency), multiply by last price in USDT
+            oi_ccy = safe_float(row.get("oiCcy"))
+            last = await self.okx_ticker(instId)
+            last_px = safe_float(last.get("last")) if last else None
+            if oi_ccy is not None and last_px is not None:
+                return oi_ccy * last_px
+            # Fallback: oi (contracts) times ctVal * last_px if ctVal present
+            oi = safe_float(row.get("oi"))
+            ctVal = safe_float(row.get("ctVal"))
+            if oi is not None and ctVal is not None and last_px is not None:
+                return oi * ctVal * last_px
+            return None
         except Exception as e:
-            log.warning("okx_ticker_last %s failed: %s", inst_id, e)
+            log.warning("open interest %s failed: %s", instId, e)
             return None
 
-    async def okx_open_interest_usd(self, inst_id):
-        """Approx USD OI = oiCcy * last_price (USDT-margined swap)."""
+    async def okx_candles(self, instId: str, bar: str, limit: int) -> pd.DataFrame:
+        """
+        Returns DataFrame with columns: ts, open, high, low, close
+        bar: "1D","1W" etc.
+        """
+        js = await self.okx_get("/api/v5/market/candles", {"instId": instId, "bar": bar, "limit": str(limit)})
+        raw = js.get("data", [])
+        # OKX returns reverse chronological; we sort ascending
+        rows = []
+        for r in raw:
+            # [ts, o, h, l, c, vol, volCcy, volCcyQuote, ...]
+            ts = int(r[0])
+            o = float(r[1])
+            h = float(r[2])
+            l = float(r[3])
+            c = float(r[4])
+            rows.append((ts, o, h, l, c))
+        df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close"]).sort_values(
+            "ts").reset_index(drop=True)
+        return df
+
+    # ---- Google Trends (run sync in a thread)
+    async def google_trends_score(self, kw: List[str]) -> Optional[float]:
+        def _work():
+            tr = TrendReq(hl="en-US", tz=0)
+            tr.build_payload(kw, timeframe="now 7-d")
+            df = tr.interest_over_time()
+            if df.empty:
+                return None
+            # average across keywords & time
+            vals = df[kw].mean(axis=1)
+            return float(vals.mean())
         try:
-            oi_r = await self.client.get("https://www.okx.com/api/v5/public/open-interest",
-                                         params={"instType": "SWAP", "instId": inst_id})
-            oi_r.raise_for_status()
-            oi_data = oi_r.json().get("data") or []
-            if not oi_data:
-                return None
-            oi_ccy = safe_float(oi_data[0].get("oiCcy"))  # in coin units
-            last = await self.okx_ticker_last(inst_id)
-            if oi_ccy is None or last is None:
-                return None
-            return oi_ccy * last
+            return await asyncio.to_thread(_work)
         except Exception as e:
-            log.warning("okx_open_interest_usd %s failed: %s", inst_id, e)
+            log.warning("pytrends failed: %s", e)
             return None
 
-    async def okx_candles(self, inst_id, bar="1W", limit=400):
-        """Return list of closes (oldest->newest) for OKX instrument."""
-        try:
-            r = await self.client.get("https://www.okx.com/api/v5/market/candles",
-                                      params={"instId": inst_id, "bar": bar, "limit": str(limit)})
-            r.raise_for_status()
-            raw = r.json().get("data") or []
-            closes_desc = [safe_float(row[4])
-                           for row in raw if safe_float(row[4]) is not None]
-            closes = list(reversed(closes_desc))
-            return closes
-        except Exception as e:
-            log.warning("okx_candles %s %s failed: %s", inst_id, bar, e)
-            return []
-
-    async def okx_btc_daily_closes(self, limit=500):
-        return await self.okx_candles("BTC-USDT", bar="1D", limit=limit)
-
-    # ---------- Google Trends ----------
-    def google_trends_score(self, kw_list=("crypto", "bitcoin", "ethereum"), days=7):
-        try:
-            self.trends.build_payload(
-                list(kw_list), timeframe=f"today {days}-d", geo="")
-            df = self.trends.interest_over_time()
-            if df is None or df.empty:
-                return None
-            # mean of last window across series
-            cols = [c for c in df.columns if c != "isPartial"]
-            vals = []
-            for c in cols:
-                vals.extend(df[c].tail(days).tolist())
-            vals = [v for v in vals if v is not False]
-            if not vals:
-                return None
-            return sum(vals) / len(vals)
-        except Exception as e:
-            log.warning("google_trends_score failed: %s", e)
-            return None
-
-    # ---------- Fear & Greed ----------
-    async def fear_greed(self, limit=1):
-        try:
-            r = await self.client.get("https://api.alternative.me/fng/", params={"limit": str(limit)})
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            log.warning("fear_greed failed: %s", e)
-            return {}
-
-    # ---------- CMC TOTAL3 (optional) ----------
-    async def cmc_total3(self):
-        """Return TOTAL3 market cap (USD) if CMC_API_KEY provided, else None."""
-        if not self.cmc_key:
-            return None
-        try:
-            # CMC Global Metrics v1:
-            # We'll approximate TOTAL3 by total_market_cap - (BTC+ETH mcap)
-            headers = {"X-CMC_PRO_API_KEY": self.cmc_key}
-            r = await self.client.get("https://pro-api.coinmarketcap.com/v1/global-metrics/quotes/latest",
-                                      headers=headers, params={"convert": "USD"})
-            r.raise_for_status()
-            data = r.json().get("data", {})
-            total = data.get("quote", {}).get(
-                "USD", {}).get("total_market_cap")
-            btc_dominance = data.get("btc_dominance")  # %
-            eth_dominance = data.get("eth_dominance")  # %
-            if total is None or btc_dominance is None or eth_dominance is None:
-                return None
-            btc_mcap = total * (btc_dominance / 100.0)
-            eth_mcap = total * (eth_dominance / 100.0)
-            total3 = total - btc_mcap - eth_mcap
-            return total3
-        except Exception as e:
-            log.warning("cmc_total3 failed: %s", e)
-            return None
-
-# ---------- Technicals ----------
+    # ---- Fear & Greed
+    async def fear_greed(self, limit: int = 1) -> List[Dict[str, Any]]:
+        r = await self.client.get(f"https://api.alternative.me/fng/?limit={limit}")
+        r.raise_for_status()
+        return r.json().get("data", [])
 
 
-def rsi(values, length=14):
-    vals = [v for v in values if v is not None]
-    if len(vals) < length + 1:
-        return None
-    gains = []
-    losses = []
-    for i in range(1, len(vals)):
-        diff = vals[i] - vals[i-1]
-        gains.append(max(0.0, diff))
-        losses.append(max(0.0, -diff))
-    # Wilder's smoothing
-    avg_gain = sum(gains[:length]) / length
-    avg_loss = sum(losses[:length]) / length
-    for i in range(length, len(gains)):
-        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
-        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+# --------------- Metrics Gathering & Computation -----------
+async def gather_metrics(dc: DataClient, risk: str) -> Dict[str, Any]:
+    # Market cap & dominance (CMC preferred if key provided)
+    cmc_task = asyncio.create_task(
+        dc.cmc_global() if CMC_API_KEY else asyncio.sleep(0, result=None))
+    cg_task = asyncio.create_task(dc.cg_global())
 
+    # Prices for ETH/BTC (spot ticker) and BTC-USDT spot for some fallbacks
+    ticker_ethbtc_t = asyncio.create_task(dc.okx_ticker(OKX_SPOT_ETHBTC))
+    # For OI conversion we sometimes need last prices, but okx_oi_usd fetches internally
 
-def ma(series, length):
-    if series is None or len(series) < length:
-        return None
-    return sum(series[-length:]) / float(length)
+    # Derivatives (funding & OI)
+    fund_tasks = {inst: asyncio.create_task(
+        dc.okx_funding(inst)) for inst in OKX_FUTS}
+    oi_btc_t = asyncio.create_task(dc.okx_oi_usd("BTC-USDT-SWAP"))
+    oi_eth_t = asyncio.create_task(dc.okx_oi_usd("ETH-USDT-SWAP"))
 
+    # Google trends
+    trends_t = asyncio.create_task(
+        dc.google_trends_score(["crypto", "bitcoin", "ethereum"]))
 
-def stoch_rsi(values, length=14, k_smooth=3, d_smooth=3):
-    """Return (K,D) last values. K/D in [0..1]."""
-    # Build RSI series
-    vals = [v for v in values if v is not None]
-    if len(vals) < length + 2:
-        return (None, None)
-    # Make rolling RSI values (simple approach: RSI over the trailing length each step)
-    rsis = []
-    for i in range(length, len(vals)):
-        r = rsi(vals[:i+1], length)
-        if r is not None:
-            rsis.append(r)
-    if len(rsis) < length:
-        return (None, None)
+    # Fear & Greed
+    fng_now_t = asyncio.create_task(dc.fear_greed(limit=1))
+    fng_hist_t = asyncio.create_task(dc.fear_greed(limit=60))
 
-    def roll_min_max(arr, w):
-        w = min(w, len(arr))
-        sub = arr[-w:]
-        return min(sub), max(sub)
-    lo, hi = roll_min_max(rsis, length)
-    if hi - lo == 0:
-        raw_k = 0.5
+    # Candles for TA
+    btc_day_t = asyncio.create_task(dc.okx_candles("BTC-USDT", "1D", 500))
+    btc_w_t = asyncio.create_task(dc.okx_candles("BTC-USDT", "1W", 400))
+    ethbtc_w_t = asyncio.create_task(dc.okx_candles("ETH-BTC", "1W", 400))
+    alt_week_tasks = {sym: asyncio.create_task(
+        dc.okx_candles(sym, "1W", 400)) for sym in ALT_BASKET}
+
+    # Await market caps
+    cmc = await cmc_task
+    cg = await cg_task
+
+    if cmc:
+        totalcap = safe_float(cmc.get("quote", {}).get(
+            "USD", {}).get("total_market_cap"))
+        btc_dom = safe_float(cmc.get("btc_dominance"))
     else:
-        raw_k = (rsis[-1] - lo) / (hi - lo)
-    # smooth K and D
+        totalcap = safe_float(cg.get("total_market_cap", {}).get("usd"))
+        btc_dom = safe_float(cg.get("market_cap_percentage", {}).get("btc"))
 
-    def sma_last(arr, w):
-        w = min(w, len(arr))
-        return sum(arr[-w:]) / w
-    # build small buffers for smoothing
-    k_buf = []
-    for i in range(length, len(rsis)+1):
-        lo_i, hi_i = roll_min_max(rsis[:i], length)
-        if hi_i - lo_i == 0:
-            k_i = 0.5
-        else:
-            k_i = (rsis[i-1] - lo_i) / (hi_i - lo_i)
-        k_buf.append(k_i)
-    k_sm = sma_last(k_buf, k_smooth)
-    # D smooth over K
-    d_buf = []
-    for i in range(len(k_buf)):
-        d_buf.append(sma_last(k_buf[:i+1], k_smooth))
-    d_sm = sma_last(d_buf, d_smooth)
-    return (k_sm, d_sm)
+    ethbtc_tick = await ticker_ethbtc_t
+    eth_btc = safe_float(ethbtc_tick.get("last")) if ethbtc_tick else None
 
-
-def resample_2w_from_weekly(closes_weekly):
-    """Take weekly closes and keep every 2nd as a 2W close series (oldest -> newest)."""
-    if not closes_weekly or len(closes_weekly) < 4:
-        return []
-    return [closes_weekly[i] for i in range(0, len(closes_weekly), 2)]
-
-
-def fib_1272_proximity(current_price, swing_low, swing_high):
-    """Distance to 1.272 extension above swing_high (uptrend context)."""
-    if None in (current_price, swing_low, swing_high):
-        return None
-    if swing_high <= swing_low:
-        return None
-    ext = swing_high + 1.272 * (swing_high - swing_low)
-    if ext <= 0:
-        return None
-    dist = abs(current_price - ext) / ext * 100.0
-    # clamp insane distances
-    return min(dist, 100.0), ext
-
-# ---------- Pi Cycle (OKX 1D BTC) ----------
-
-
-def sma(values, length):
-    if values is None or len(values) < length:
-        return None
-    return sum(values[-length:]) / float(length)
-
-
-def compute_pi_cycle_from_closes(closes_1d):
-    out = {"ma111": None, "ma350x2": None, "ratio": None,
-           "proximity_pct": None, "trend": "n/a"}
-    if not closes_1d or len(closes_1d) < 350:
-        return out
-    m111 = sma(closes_1d, 111)
-    m350 = sma(closes_1d, 350)
-    if m111 is None or m350 is None:
-        return out
-    m350x2 = 2.0 * m350
-    if m350x2 <= 0:
-        return out
-    ratio = m111 / m350x2
-    prox = abs(ratio - 1.0) * 100.0
-    out.update({"ma111": m111, "ma350x2": m350x2, "ratio": ratio,
-               "proximity_pct": prox, "trend": ("above" if ratio >= 1.0 else "below")})
-    return out
-
-
-def pi_color(ratio):
-    if ratio is None:
-        return "🟡"
-    if ratio >= 1.00:
-        return "🔴"
-    if ratio >= 0.99:
-        return "🟡"
-    return "🟢"
-
-
-def pi_subscore(pi):
-    ratio = pi.get("ratio") if isinstance(pi, dict) else None
-    if ratio is None:
-        return 0
-    if ratio >= 1.02:
-        return 100
-    if ratio >= 1.00:
-        return int(75 + (ratio - 1.00) / 0.02 * 25)
-    if ratio >= 0.99:
-        return int(40 + (ratio - 0.99) / 0.01 * 35)
-    if ratio >= 0.98:
-        return int((ratio - 0.98) / 0.01 * 20)
-    return 0
-
-# ---------- Metrics gather ----------
-
-
-async def gather_metrics(dc: DataClient):
-    out = {}
-    # Coingecko global
-    g = await dc.coingecko_global()
-    total_mcap = (g.get("total_market_cap") or {}).get("usd")
-    mc_pct = g.get("market_cap_percentage") or {}
-    btc_dom = mc_pct.get("btc")
-    eth_dom = mc_pct.get("eth")
-    btc_mcap = None
-    eth_mcap = None
+    # Alt mcap ratio
     altcap_ratio = None
-    if total_mcap and btc_dom is not None:
-        btc_mcap = total_mcap * (btc_dom/100.0)
+    if totalcap is not None and btc_dom is not None:
+        altcap = totalcap * (1.0 - btc_dom/100.0)
+        btc_mcap = totalcap * (btc_dom/100.0)
         if btc_mcap > 0:
-            altcap_ratio = (total_mcap - btc_mcap) / btc_mcap
+            altcap_ratio = altcap / btc_mcap
+    else:
+        altcap = None
+        btc_mcap = None
 
-    prices = await dc.cg_simple_price(("bitcoin", "ethereum"), "usd")
-    eth_btc = None
-    try:
-        if "bitcoin" in prices and "ethereum" in prices:
-            btc_usd = float(prices["bitcoin"]["usd"])
-            eth_usd = float(prices["ethereum"]["usd"])
-            if btc_usd > 0:
-                eth_btc = eth_usd / btc_usd
-    except Exception:
-        pass
+    # Derivatives results
+    funding = {inst: await ft for inst, ft in fund_tasks.items()}
 
-    # Funding basket (OKX)
-    funding_vals = []
-    funding_detail = []
-    for inst in CFG["funding_symbols"]:
-        fr = await dc.okx_funding_rate(inst)
-        if fr is not None:
-            funding_vals.append(fr)
-        funding_detail.append((inst, fr))
-    funding_max = None if not funding_vals else max(
-        abs(v) for v in funding_vals)
-    funding_median = None
-    if funding_vals:
-        # median of absolute values
-        funding_median = statistics.median([abs(v) for v in funding_vals])
+    oi_btc = await oi_btc_t
+    oi_eth = await oi_eth_t
 
-    # OI BTC/ETH
-    oi_btc = await dc.okx_open_interest_usd("BTC-USDT-SWAP")
-    oi_eth = await dc.okx_open_interest_usd("ETH-USDT-SWAP")
+    # Trends & Fear/Greed
+    trends_score = await trends_t
+    fng_now = await fng_now_t
+    fng_hist = await fng_hist_t
 
-    # Google Trends 7d avg
-    trends_7 = dc.google_trends_score(
-        ("crypto", "bitcoin", "ethereum"), days=7)
-
-    # Fear & Greed now + history
-    fg_now = None
-    fg14 = None
-    fg30 = None
-    greed_run = 0
-    greed_pct30 = 0
-    try:
-        now = await dc.fear_greed(limit=1)
-        data_now = (now.get("data") or [])
-        if data_now:
-            fg_now = safe_float(data_now[0].get("value"))
-        hist = await dc.fear_greed(limit=60)
-        hist_data = hist.get("data") or []
-        vals = [safe_float(d.get("value"))
-                for d in hist_data if safe_float(d.get("value")) is not None]
-        vals = list(reversed(vals))  # oldest->newest
+    fng_val = None
+    fng_ma14 = None
+    fng_ma30 = None
+    greed_streak = 0
+    greed_pct30 = None
+    if fng_now:
+        fng_val = safe_float(fng_now[0].get("value"))
+    if fng_hist:
+        vals = [safe_float(x.get("value"))
+                for x in fng_hist if safe_float(x.get("value")) is not None]
         if vals:
-            # Greed persistence: count consecutive >=70 from end
-            for v in reversed(vals):
+            ser = pd.Series(list(reversed(vals)))  # chronological
+            fng_ma14 = float(ser.rolling(14).mean(
+            ).iloc[-1]) if len(ser) >= 14 else None
+            fng_ma30 = float(ser.rolling(30).mean(
+            ).iloc[-1]) if len(ser) >= 30 else None
+            # greed streak (>=70)
+            streak = 0
+            for v in reversed(vals):  # from most recent going back
                 if v is not None and v >= 70:
-                    greed_run += 1
+                    streak += 1
                 else:
                     break
-            last30 = vals[-30:] if len(vals) >= 30 else vals
+            greed_streak = streak
+            last30 = [v for v in vals[:30] if v is not None]
             if last30:
-                greed_pct30 = int(
-                    round(100.0 * sum(1 for v in last30 if v >= 70) / len(last30)))
-            last14 = vals[-14:] if len(vals) >= 14 else vals
-            if last14:
-                fg14 = sum(last14) / len(last14)
-            if last30:
-                fg30 = sum(last30) / len(last30)
+                greed_pct30 = 100.0 * \
+                    sum(1 for v in last30 if v >= 70) / len(last30)
+
+    # TA series
+    btc_day = await btc_day_t
+    btc_week = await btc_w_t
+    ethbtc_week = await ethbtc_w_t
+    alt_weeks = {sym: await alt_week_tasks[sym] for sym in ALT_BASKET}
+
+    # BTC Pi Cycle (111D SMA vs 2 * 350D SMA from OKX daily)
+    pi_prox = None
+    pi_crossed = False
+    days_since_cross = None
+    try:
+        closes = btc_day["close"]
+        sma111 = closes.rolling(111).mean()
+        sma350 = closes.rolling(350).mean()
+        line = sma350 * 2.0
+        if len(closes) >= 350:
+            last_ratio = float(
+                sma111.iloc[-1] / (line.iloc[-1] + 1e-9)) * 100.0
+            pi_prox = last_ratio  # 100% == cross
+            # detect last cross (sma111 crossing above line)
+            above = (sma111 > line)
+            if above.iloc[-1]:
+                pi_crossed = True
+                # find when it crossed most recently
+                cross_idx = None
+                for i in range(len(above)-2, -1, -1):
+                    if not above.iloc[i]:
+                        cross_idx = i+1
+                        break
+                if cross_idx is None:
+                    cross_idx = 0
+                days_since_cross = int((len(above)-1) - cross_idx)
     except Exception as e:
-        log.warning("F&G processing failed: %s", e)
+        log.warning("Pi cycle computation failed: %s", e)
 
-    # Pi Cycle using OKX 1D BTC
-    btc_1d = await dc.okx_btc_daily_closes(limit=500)
-    pi = compute_pi_cycle_from_closes(btc_1d) if btc_1d else {
-        "ratio": None, "proximity_pct": None, "trend": "n/a"}
+    # Weekly RSI/Stoch (2W requested): Build 2W close for BTC, ETH/BTC, and an equal-weight ALT basket
+    btc_week_close = btc_week["close"]
+    ethbtc_week_close = ethbtc_week["close"]
 
-    # Weekly/2W momentum (BTC, ETH/BTC, ALT basket)
-    btc_w = await dc.okx_candles("BTC-USDT", bar="1W", limit=400)
-    ethbtc_w = await dc.okx_candles("ETH-BTC", bar="1W", limit=400)
+    btc_2w = two_week_downsample(btc_week_close)
+    ethbtc_2w = two_week_downsample(ethbtc_week_close)
 
-    # ALT basket weekly closes: average normalized index
-    alt_closes_map = {}
-    for sym in CFG["alt_basket"]:
-        alt_closes_map[sym] = await dc.okx_candles(sym, bar="1W", limit=400)
-    # build equal-weight index
-    eqw_series = []
-    # normalize each coin to 1 at start of available common window
-    min_len = min((len(v) for v in alt_closes_map.values() if v), default=0)
-    if min_len >= 50:
-        idx_matrix = []
-        for v in alt_closes_map.values():
-            v2 = v[-min_len:]
-            base = v2[0]
-            if base and base > 0:
-                idx = [x/base for x in v2]
-                idx_matrix.append(idx)
-        if idx_matrix:
-            # equal weight mean per step
-            for i in range(min_len):
-                eqw_series.append(sum(row[i]
-                                  for row in idx_matrix)/len(idx_matrix))
+    btc_rsi_2w = rsi(btc_2w, 14)
+    ethbtc_rsi_2w = rsi(ethbtc_2w, 14)
 
-    # 2W resample
-    btc_2w = resample_2w_from_weekly(btc_w)
-    ethbtc_2w = resample_2w_from_weekly(ethbtc_w)
-    alt_2w = resample_2w_from_weekly(eqw_series)
+    btc_rsi_ma = btc_rsi_2w.rolling(10).mean()
+    ethbtc_rsi_ma = ethbtc_rsi_2w.rolling(10).mean()
 
-    # RSI and MA on RSI (use 14, MA len 10)
-    rsi_len = 14
-    rsi_ma_len = 10
-    rsi_btc_2w = rsi(btc_2w, rsi_len)
-    rsi_btc_2w_ma = None
-    if len(btc_2w) >= (rsi_len + rsi_ma_len + 1):
-        # build RSI series for last rsi_ma_len
-        rsis = []
-        for i in range(rsi_len, len(btc_2w)+1):
-            rsis.append(rsi(btc_2w[:i], rsi_len))
-        rsis = [x for x in rsis if x is not None]
-        if len(rsis) >= rsi_ma_len:
-            rsi_btc_2w_ma = sum(rsis[-rsi_ma_len:]) / rsi_ma_len
+    btc_k_2w, btc_d_2w = stoch_rsi(btc_rsi_2w, 14, 3, 3)
 
-    rsi_ethbtc_2w = rsi(ethbtc_2w, rsi_len)
-    rsi_ethbtc_2w_ma = None
-    if len(ethbtc_2w) >= (rsi_len + rsi_ma_len + 1):
-        rsis = []
-        for i in range(rsi_len, len(ethbtc_2w)+1):
-            rsis.append(rsi(ethbtc_2w[:i], rsi_len))
-        rsis = [x for x in rsis if x is not None]
-        if len(rsis) >= rsi_ma_len:
-            rsi_ethbtc_2w_ma = sum(rsis[-rsi_ma_len:]) / rsi_ma_len
+    # ALT equal-weight “index” (rebased 1.0 at start; simple average of normalized series)
+    alt_df = pd.DataFrame()
+    for sym, df in alt_weeks.items():
+        alt_df[sym] = df["close"].values
+    # align lengths by trimming to min length
+    min_len = min(len(col) for col in alt_df.columns.map(lambda c: alt_df[c]))
+    for sym in alt_df.columns:
+        alt_df[sym] = alt_df[sym].iloc[-min_len:].reset_index(drop=True)
+    # normalize each series to 1.0 at start
+    norm = alt_df / alt_df.iloc[0]
+    alt_index = norm.mean(axis=1)
+    alt_index_2w = two_week_downsample(pd.Series(alt_index))
+    alt_rsi_2w = rsi(alt_index_2w, 14)
+    alt_rsi_ma = alt_rsi_2w.rolling(10).mean()
+    alt_k_2w, alt_d_2w = stoch_rsi(alt_rsi_2w, 14, 3, 3)
 
-    rsi_alt_2w = rsi(alt_2w, rsi_len) if alt_2w else None
-    rsi_alt_2w_ma = None
-    if alt_2w and len(alt_2w) >= (rsi_len + rsi_ma_len + 1):
-        rsis = []
-        for i in range(rsi_len, len(alt_2w)+1):
-            rsis.append(rsi(alt_2w[:i], rsi_len))
-        rsis = [x for x in rsis if x is not None]
-        if len(rsis) >= rsi_ma_len:
-            rsi_alt_2w_ma = sum(rsis[-rsi_ma_len:]) / rsi_ma_len
+    # Fibonacci proximity (weekly)
+    btc_ext, btc_pct_away = fib_extension_proximity(
+        btc_week_close, lookback_weeks=52)
+    alt_ext, alt_pct_away = fib_extension_proximity(
+        pd.Series(alt_index), lookback_weeks=52)
 
-    # Stoch RSI (2W)
-    k_btc_2w, d_btc_2w = stoch_rsi(btc_2w, length=14, k_smooth=3, d_smooth=3)
-    k_alt_2w, d_alt_2w = stoch_rsi(
-        alt_2w, length=14, k_smooth=3, d_smooth=3) if alt_2w else (None, None)
+    # Funding basket summary
+    fund_vals = [v for v in funding.values() if v is not None]
+    fund_abs = [abs(100*v) for v in fund_vals]  # to %
+    fund_max = max(fund_abs) if fund_abs else None
+    fund_med = float(np.median(fund_abs)) if fund_abs else None
+    # top-3 extremes by absolute
+    top3 = []
+    if fund_vals:
+        pairs = list(funding.items())
+        pairs_pct = [(k, abs(100.0*v) if v is not None else None)
+                     for k, v in pairs]
+        pairs_pct = [p for p in pairs_pct if p[1] is not None]
+        pairs_pct.sort(key=lambda x: x[1], reverse=True)
+        top3 = pairs_pct[:3]
 
-    # Fibonacci proximity on 1W
-    fib_btc = (None, None)
-    fib_alt = (None, None)
-    try:
-        if btc_w and len(btc_w) >= 60:
-            cur = btc_w[-1]
-            look = btc_w[-60:]
-            swing_low = min(look)
-            swing_high = max(look)
-            fb = fib_1272_proximity(cur, swing_low, swing_high)
-            if fb:
-                fib_btc = fb
-    except Exception:
-        pass
-    try:
-        if eqw_series and len(eqw_series) >= 60:
-            cur = eqw_series[-1]
-            look = eqw_series[-60:]
-            swing_low = min(look)
-            swing_high = max(look)
-            fa = fib_1272_proximity(cur, swing_low, swing_high)
-            if fa:
-                fib_alt = fa
-    except Exception:
-        pass
+    # Build result dict
+    out: Dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "risk": risk,
 
-    # Optional TOTAL3 via CMC
-    total3 = await dc.cmc_total3()
-
-    out.update({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "risk_profile": CFG.get("risk_profile", "moderate"),
-        "btc_dominance": btc_dom,
+        "totalcap": totalcap,
+        "btc_dom": btc_dom,
         "eth_btc": eth_btc,
         "altcap_btc_ratio": altcap_ratio,
-        "funding_max": None if funding_max is None else (funding_max * 100.0),
-        "funding_median": None if funding_median is None else (funding_median * 100.0),
-        "funding_detail": funding_detail,
+
+        "funding": funding,
+        "funding_max_pct": fund_max,
+        "funding_med_pct": fund_med,
+        "funding_top3": top3,
+
         "oi_btc_usd": oi_btc,
         "oi_eth_usd": oi_eth,
-        "trends_7": trends_7,
-        "fng_now": fg_now,
-        "fng_ma14": fg14,
-        "fng_ma30": fg30,
-        "fng_greed_run": greed_run,
-        "fng_greed_pct30": greed_pct30,
-        "pi_cycle": pi,
-        "rsi_btc_2w": rsi_btc_2w,
-        "rsi_btc_2w_ma": rsi_btc_2w_ma,
-        "rsi_ethbtc_2w": rsi_ethbtc_2w,
-        "rsi_ethbtc_2w_ma": rsi_ethbtc_2w_ma,
-        "rsi_alt_2w": rsi_alt_2w,
-        "rsi_alt_2w_ma": rsi_alt_2w_ma,
-        "stoch_btc_2w_k": k_btc_2w, "stoch_btc_2w_d": d_btc_2w,
-        "stoch_alt_2w_k": k_alt_2w, "stoch_alt_2w_d": d_alt_2w,
-        "fib_btc": fib_btc,  # (distance %, level)
-        "fib_alt": fib_alt,
-        "total3": total3
-    })
+
+        "trends_avg7": trends_score,
+
+        "fng": {
+            "value": fng_val,
+            "ma14": fng_ma14,
+            "ma30": fng_ma30,
+            "streak_greed_days": greed_streak,
+            "pct30_greed": greed_pct30
+        },
+
+        "pi": {
+            "prox_pct": pi_prox,           # 100% == cross
+            "crossed": pi_crossed,
+            "days_since_cross": days_since_cross
+        },
+
+        "ta": {
+            "btc": {
+                "rsi_2w": float(btc_rsi_2w.iloc[-1]) if len(btc_rsi_2w) else None,
+                "rsi_2w_ma": float(btc_rsi_ma.iloc[-1]) if len(btc_rsi_ma) else None,
+                "k_2w": float(btc_k_2w.iloc[-1]) if len(btc_k_2w) else None,
+                "d_2w": float(btc_d_2w.iloc[-1]) if len(btc_d_2w) else None,
+                "fib1272": btc_ext,
+                "fib_pct_away": btc_pct_away
+            },
+            "ethbtc": {
+                "rsi_2w": float(ethbtc_rsi_2w.iloc[-1]) if len(ethbtc_rsi_2w) else None,
+                "rsi_2w_ma": float(ethbtc_rsi_ma.iloc[-1]) if len(ethbtc_rsi_ma) else None,
+            },
+            "alt": {
+                "rsi_2w": float(alt_rsi_2w.iloc[-1]) if len(alt_rsi_2w) else None,
+                "rsi_2w_ma": float(alt_rsi_ma.iloc[-1]) if len(alt_rsi_ma) else None,
+                "k_2w": float(alt_k_2w.iloc[-1]) if len(alt_k_2w) else None,
+                "d_2w": float(alt_d_2w.iloc[-1]) if len(alt_d_2w) else None,
+                "fib1272": alt_ext,
+                "fib_pct_away": alt_pct_away
+            }
+        }
+    }
+
     return out
 
-# ---------- Composite scoring ----------
+# --------------- Scoring & Formatting ----------------------
 
 
-def scale_01(x, lo, hi):
-    if x is None:
-        return 0.0
-    if hi == lo:
-        return 0.0
-    return clamp((x - lo) / (hi - lo), 0.0, 1.0)
+def score_from_band(band: str, green: int, yellow: int, red: int) -> int:
+    # convenience mapping
+    if band == "green":
+        return green
+    if band == "yellow":
+        return yellow
+    if band == "red":
+        return red
+    return 0
 
 
-def subscores_from_metrics(m):
-    subs = {}
+def composite_score(m: Dict[str, Any]) -> Tuple[int, List[Tuple[str, int]]]:
+    """Return total score (0-100) and list of (label, score) drivers."""
+    t = m.get("ta", {})
+    fng = m.get("fng", {})
+    risk = m.get("risk", "moderate")
+    mult = RISK_MULT.get(risk, 1.0)
 
-    # Alt structure (higher ratios => closer to alt top risk)
-    subs["altcap_vs_btc"] = int(
-        scale_01(m.get("altcap_btc_ratio"), 1.2, 1.8) * 100)
-    subs["eth_btc"] = int(scale_01(m.get("eth_btc"), 0.07, 0.09) * 100)
+    drivers: List[Tuple[str, int]] = []
 
-    # Funding (abs %)
-    subs["funding"] = int(scale_01(m.get("funding_max"), 0.08, 0.10) * 100)
+    # Market structure
+    btc_dom = m.get("btc_dom")
+    eth_btc = m.get("eth_btc")
+    alt_ratio = m.get("altcap_btc_ratio")
 
-    # OI caps
-    subs["OI_BTC"] = int(
-        scale_01((m.get("oi_btc_usd") or 0)/1e9, 16, 20) * 100)  # in $B
-    subs["OI_ETH"] = int(
-        scale_01((m.get("oi_eth_usd") or 0)/1e9, 6.4, 8.0) * 100)
+    # thresholds (adjusted by risk mult where relevant)
+    def adj(x): return x * mult
 
-    # Trends (Google)
-    subs["trends"] = int(scale_01(m.get("trends_7"), 60, 75) * 100)
+    # BTC dominance high -> risk to alts
+    band_btc_dom = tri_flag(
+        btc_dom, warn=48.0, flag=60.0, higher_is_risk=True)[1]
+    drivers.append(("BTC dominance", score_from_band(band_btc_dom, 0, 50, 90)))
 
-    # Fear & Greed family (note: 56..70 scaled to 0..100)
-    def fng_score(v, lo, hi):
-        return int(scale_01(v, lo, hi) * 100)
-    subs["fng_now"] = fng_score(m.get("fng_now"), 56, 70)
-    subs["fng_ma14"] = fng_score(m.get("fng_ma14"), 56, 70)
-    subs["fng_ma30"] = fng_score(m.get("fng_ma30"), 52, 65)
-    # persistence (either high run of days OR high % last 30)
-    run = m.get("fng_greed_run") or 0
-    pct30 = m.get("fng_greed_pct30") or 0
-    run_s = scale_01(run, 8, 10)
-    pct_s = scale_01(pct30, 48, 60)
-    subs["fng_persist"] = int(100 * max(run_s, pct_s))
+    # ETH/BTC high -> later stage
+    band_ethbtc = tri_flag(eth_btc, warn=0.072,
+                           flag=0.09, higher_is_risk=True)[1]
+    drivers.append(("ETH/BTC", score_from_band(band_ethbtc, 0, 40, 80)))
 
-    # Pi Cycle
-    subs["pi"] = pi_subscore(m.get("pi_cycle", {}))
-
-    # Momentum bits (2W BTC/ALT + 1W fib)
-    subs["RSI_BTC_2W"] = int(scale_01(m.get("rsi_btc_2w"), 60, 70) * 100)
-    subs["RSI_ETHBTC_2W"] = int(scale_01(m.get("rsi_ethbtc_2w"), 55, 65) * 100)
-    # Stoch: risk when overbought (>=0.8) and bearish cross (K<D)
-    k_b, d_b = m.get("stoch_btc_2w_k"), m.get("stoch_btc_2w_d")
-    if k_b is None or d_b is None:
-        subs["Stoch_BTC_2W"] = 0
-    else:
-        ob = 1 if (k_b >= 0.8 or d_b >= 0.8) else 0
-        cross = 1 if (k_b < d_b and (k_b >= 0.8 or d_b >= 0.8)) else 0
-        subs["Stoch_BTC_2W"] = int(100 * (0.5*ob + 0.5*cross))
-
-    # ALT RSI/Stoch
-    subs["RSI_ALT_2W"] = int(scale_01(m.get("rsi_alt_2w"), 65, 75) * 100)
-    k_a, d_a = m.get("stoch_alt_2w_k"), m.get("stoch_alt_2w_d")
-    if k_a is None or d_a is None:
-        subs["Stoch_ALT_2W"] = 0
-    else:
-        ob = 1 if (k_a >= 0.8 or d_a >= 0.8) else 0
-        cross = 1 if (k_a < d_a and (k_a >= 0.8 or d_a >= 0.8)) else 0
-        subs["Stoch_ALT_2W"] = int(100 * (0.5*ob + 0.5*cross))
-
-    # Fib proximity (distance <= thresholds => high risk)
-    fib_btc = m.get("fib_btc") or (None, None)
-    fib_alt = m.get("fib_alt") or (None, None)
-    dist_btc = fib_btc[0]
-    dist_alt = fib_alt[0]
-    subs["Fib_BTC"] = int(scale_01(
-        3.0 - clamp(dist_btc if dist_btc is not None else 999, 0, 3.0), 0.0, 3.0) * 100)
-    subs["Fib_ALT"] = int(scale_01(
-        3.0 - clamp(dist_alt if dist_alt is not None else 999, 0, 3.0), 0.0, 3.0) * 100)
-
-    return subs
-
-
-def composite_certainty(m, profile="moderate"):
-    """Return (score0..100, top5 list[(name,score,contrib)], flags[list[str]])."""
-    subs = subscores_from_metrics(m)
-
-    # profile weights
-    base_w = {
-        "altcap_vs_btc": 0.10, "eth_btc": 0.10,
-        "funding": 0.08, "OI_BTC": 0.10, "OI_ETH": 0.05,
-        "trends": 0.08,
-        "fng_now": 0.07, "fng_ma14": 0.07, "fng_ma30": 0.08, "fng_persist": 0.07,
-        "pi": 0.10,
-        "RSI_BTC_2W": 0.05, "RSI_ETHBTC_2W": 0.05,
-        "Stoch_BTC_2W": 0.05, "RSI_ALT_2W": 0.05, "Stoch_ALT_2W": 0.05,
-        "Fib_BTC": 0.05, "Fib_ALT": 0.05
-    }
-    if profile == "conservative":
-        # slightly more weight on sentiment/derivs
-        base_w["fng_persist"] += 0.03
-        base_w["funding"] += 0.02
-        base_w["OI_BTC"] += 0.02
-    elif profile == "aggressive":
-        # more on momentum
-        base_w["RSI_ALT_2W"] += 0.03
-        base_w["Stoch_ALT_2W"] += 0.03
-        base_w["RSI_ETHBTC_2W"] += 0.02
-
-    # normalize weights to sum 1
-    total_w = sum(base_w.values())
-    for k in base_w:
-        base_w[k] = base_w[k] / total_w
-
-    # compute score
-    parts = []
-    score = 0.0
-    for k, w in base_w.items():
-        s = subs.get(k, 0)
-        contrib = w * s
-        score += contrib
-        parts.append((k, s, contrib))
-    parts.sort(key=lambda t: t[2], reverse=True)
-    top5 = parts[:5]
-
-    # threshold colors
-    color = "🟢"
-    if score >= 70:
-        color = "🔴"
-    elif score >= 40:
-        color = "🟡"
-
-    # flags
-    flags = []
-    if (m.get("fng_now") or 0) >= 70:
-        flags.append("Greed is elevated (Fear & Greed Index)")
-    if (m.get("fng_ma30") or 0) >= 65:
-        flags.append("Fear & Greed 30-day avg in Greed")
-    if (m.get("fng_greed_run") or 0) >= 10 or (m.get("fng_greed_pct30") or 0) >= 60:
-        flags.append("Greed persistence is high")
-
-    return (int(round(score)), top5, color, subs)
-
-# ---------- Formatting ----------
-
-
-def fmt_line(label, value_str, color_icon, thresholds_str):
-    return f"• {label}: {color_icon} {value_str}  ({thresholds_str})"
-
-
-def format_snapshot(m):
-    lines = []
-    ts = m.get("timestamp", datetime.now(timezone.utc).isoformat())
-    profile = m.get("risk_profile", "moderate")
-    lines.append(f"📊 Crypto Market Snapshot — {ts} UTC")
-    lines.append(f"Profile: {profile}")
-    lines.append("")  # spacer
-
-    # Market Structure
-    lines.append("Market Structure")
-    # BTC dominance
-    dom = m.get("btc_dominance")
-    icon = green_yellow_red(dom, 48.0, 60.0)
-    dom_str = f"{dom:.2f}%" if dom is not None else "n/a"
-    lines.append(fmt_line("Bitcoin market share of total crypto",
-                 dom_str, icon, "warn ≥ 48.00%, flag ≥ 60.00%"))
-    # ETH/BTC
-    ebr = m.get("eth_btc")
-    icon = green_yellow_red(ebr, 0.072, 0.090)
-    ebr_str = f"{ebr:.5f}" if ebr is not None else "n/a"
-    lines.append(fmt_line("Ether price relative to Bitcoin (ETH/BTC)",
-                 ebr_str, icon, "warn ≥ 0.07200, flag ≥ 0.09000"))
-    # Altcap/BTC
-    ar = m.get("altcap_btc_ratio")
-    icon = green_yellow_red(ar, 1.44, 1.80)
-    ar_str = f"{ar:.2f}" if ar is not None else "n/a"
-    lines.append(fmt_line("Altcoin market cap / Bitcoin market cap",
-                 ar_str, icon, "warn ≥ 1.44, flag ≥ 1.80"))
-
-    lines.append("")  # spacer
+    # Alt mcap relative to BTC
+    band_altr = tri_flag(alt_ratio, warn=adj(
+        1.44), flag=adj(1.80), higher_is_risk=True)[1]
+    drivers.append(("Alt/BTC mcap", score_from_band(band_altr, 0, 60, 90)))
 
     # Derivatives
-    lines.append("Derivatives")
-    fmax = m.get("funding_max")
-    fmed = m.get("funding_median")
-    f_icon_max = green_yellow_red(fmax, 0.08, 0.10)
-    f_icon_med = green_yellow_red(fmed, 0.08, 0.10)
-    fmax_s = f"{fmax:.3f}%" if fmax is not None else "n/a"
-    fmed_s = f"{fmed:.3f}%" if fmed is not None else "n/a"
-    lines.append(
-        f"• Funding (basket: BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT, DOGEUSDT) — max: {f_icon_max} {fmax_s} | median: {f_icon_med} {fmed_s}  (warn ≥ 0.080%, flag ≥ 0.100%)")
-    # top-3 funding
-    detail = [(sym, val) for (sym, val) in (
-        m.get("funding_detail") or []) if val is not None]
-    detail_pct = sorted([(sym, abs(val)*100.0)
-                        for sym, val in detail], key=lambda x: x[1], reverse=True)[:3]
-    if detail_pct:
-        parts = [
-            f"{sym.replace('-USDT-SWAP','')} {v:.3f}%" for sym, v in detail_pct]
-        lines.append("  Top-3 funding extremes: " + ", ".join(parts))
-    # OI
-    oi_b = m.get("oi_btc_usd")
-    oi_e = m.get("oi_eth_usd")
-    icon = green_yellow_red((oi_b or 0)/1e9, 16, 20)
-    lines.append(fmt_line("Bitcoin open interest (USD)", usd(
-        oi_b), icon, "warn ≥ $16,000,000,000, flag ≥ $20,000,000,000"))
-    icon = green_yellow_red((oi_e or 0)/1e9, 6.4, 8.0)
-    lines.append(fmt_line("Ether open interest (USD)", usd(oi_e),
-                 icon, "warn ≥ $6,400,000,000, flag ≥ $8,000,000,000"))
+    fund_max = m.get("funding_max_pct")
+    band_fund = tri_flag(fund_max, warn=adj(
+        0.08), flag=adj(0.10), higher_is_risk=True)[1]
+    drivers.append(("Funding (max)", score_from_band(band_fund, 0, 25, 55)))
 
-    lines.append("")
+    oi_btc = m.get("oi_btc_usd")
+    band_oi_btc = tri_flag(oi_btc, warn=16e9, flag=20e9,
+                           higher_is_risk=True)[1]
+    drivers.append(("BTC OI", score_from_band(band_oi_btc, 0, 35, 65)))
+
+    oi_eth = m.get("oi_eth_usd")
+    band_oi_eth = tri_flag(oi_eth, warn=6.4e9, flag=8e9,
+                           higher_is_risk=True)[1]
+    drivers.append(("ETH OI", score_from_band(band_oi_eth, 0, 25, 55)))
 
     # Sentiment
-    lines.append("Sentiment")
-    tr = m.get("trends_7")
-    icon = green_yellow_red(tr, 60.0, 75.0)
-    lines.append(fmt_line("Google Trends avg (7d; crypto/bitcoin/ethereum)",
-                 (f"{tr:.1f}" if tr is not None else "n/a"), icon, "warn ≥ 60.0, flag ≥ 75.0"))
-    fng = m.get("fng_now")
-    icon = green_yellow_red(fng, 56, 70)
-    fng_str = f"{int(round(fng))} (Greed)" if fng is not None else "n/a"
-    lines.append(fmt_line("Fear & Greed Index (overall crypto)",
-                 fng_str, icon, "warn ≥ 56, flag ≥ 70"))
-    fng14 = m.get("fng_ma14")
-    icon = green_yellow_red(fng14, 56, 70)
-    lines.append(fmt_line("Fear & Greed 14-day average",
-                 (f"{fng14:.1f}" if fng14 is not None else "n/a"), icon, "warn ≥ 56, flag ≥ 70"))
-    fng30 = m.get("fng_ma30")
-    icon = green_yellow_red(fng30, 52, 65)
-    lines.append(fmt_line("Fear & Greed 30-day average",
-                 (f"{fng30:.1f}" if fng30 is not None else "n/a"), icon, "warn ≥ 52, flag ≥ 65"))
-    run = m.get("fng_greed_run") or 0
-    pct30 = m.get("fng_greed_pct30") or 0
-    icon = "🔴" if run >= 10 or pct30 >= 60 else (
-        "🟡" if run >= 8 or pct30 >= 48 else "🟢")
-    lines.append(
-        f"• Greed persistence: {icon} {run} days in a row | {pct30}% of last 30 days ≥ 70  (warn: days ≥ 8 or pct ≥ 48%; flag: days ≥ 10 or pct ≥ 60%)")
+    trends = m.get("trends_avg7")
+    band_trends = tri_flag(trends, warn=60.0, flag=75.0,
+                           higher_is_risk=True)[1]
+    drivers.append(("Google Trends", score_from_band(band_trends, 0, 30, 60)))
 
-    lines.append("")
+    val = fng.get("value")
+    band_fng = tri_flag(val, warn=56.0, flag=70.0, higher_is_risk=True)[1]
+    drivers.append(("F&G (today)", score_from_band(band_fng, 0, 50, 85)))
 
-    # Cycle & On-Chain
-    lines.append("Cycle & On-Chain")
-    pi = m.get("pi_cycle", {})
-    ratio = pi.get("ratio")
-    prox = pi.get("proximity_pct")
-    trend = pi.get("trend", "n/a")
-    icon = pi_color(ratio)
-    if ratio is None or prox is None:
-        lines.append("• Pi Cycle Top proximity: 🟡 n/a")
+    ma14 = fng.get("ma14")
+    band_fng14 = tri_flag(ma14, warn=56.0, flag=70.0, higher_is_risk=True)[1]
+    drivers.append(("F&G 14d", score_from_band(band_fng14, 0, 50, 85)))
+
+    ma30 = fng.get("ma30")
+    band_fng30 = tri_flag(ma30, warn=52.0, flag=65.0, higher_is_risk=True)[1]
+    drivers.append(("F&G 30d", score_from_band(band_fng30, 0, 60, 90)))
+
+    streak = fng.get("streak_greed_days") or 0
+    pct30 = fng.get("pct30_greed")
+    band_streak = tri_flag(streak, warn=8, flag=10, higher_is_risk=True)[1]
+    band_persist = tri_flag(pct30, warn=48.0, flag=60.0,
+                            higher_is_risk=True)[1]
+    # take harsher of the two
+    persist_score = max(score_from_band(band_streak, 0, 50, 90),
+                        score_from_band(band_persist, 0, 50, 90))
+    drivers.append(("F&G persistence", persist_score))
+
+    # Pi cycle proximity
+    pi = m.get("pi", {})
+    pi_prox = pi.get("prox_pct")
+    band_pi = tri_flag(pi_prox, warn=90.0, flag=100.0, higher_is_risk=True)[
+        1]  # near 100% is danger
+    drivers.append(("Pi Cycle", score_from_band(band_pi, 0, 60, 95)))
+
+    # 2W RSI & Stoch
+    btc_rsi = m["ta"]["btc"]["rsi_2w"]
+    btc_rsi_ma = m["ta"]["btc"]["rsi_2w_ma"]
+    band_btc_rsi = tri_flag(
+        btc_rsi, warn=60.0, flag=70.0, higher_is_risk=True)[1]
+    rsi_loss_ma = (
+        btc_rsi is not None and btc_rsi_ma is not None and btc_rsi < btc_rsi_ma)
+    rsi_score = score_from_band(
+        band_btc_rsi, 0, 35, 70) + (10 if rsi_loss_ma else 0)
+    drivers.append(("BTC RSI 2W", min(100, rsi_score)))
+
+    ethbtc_rsi = m["ta"]["ethbtc"]["rsi_2w"]
+    ethbtc_rsi_ma = m["ta"]["ethbtc"]["rsi_2w_ma"]
+    band_ethbtc_rsi = tri_flag(
+        ethbtc_rsi, warn=55.0, flag=65.0, higher_is_risk=True)[1]
+    eth_loss_ma = (
+        ethbtc_rsi is not None and ethbtc_rsi_ma is not None and ethbtc_rsi < ethbtc_rsi_ma)
+    drivers.append(("ETH/BTC RSI 2W", min(100, score_from_band(band_ethbtc_rsi,
+                   0, 35, 70) + (10 if eth_loss_ma else 0))))
+
+    # ALT basket momentum
+    alt_rsi = m["ta"]["alt"]["rsi_2w"]
+    alt_rsi_ma = m["ta"]["alt"]["rsi_2w_ma"]
+    band_alt_rsi = tri_flag(
+        alt_rsi, warn=65.0, flag=75.0, higher_is_risk=True)[1]
+    alt_loss_ma = (
+        alt_rsi is not None and alt_rsi_ma is not None and alt_rsi < alt_rsi_ma)
+    drivers.append(("ALT RSI 2W", min(100, score_from_band(
+        band_alt_rsi, 0, 30, 60) + (10 if alt_loss_ma else 0))))
+
+    # Fibonacci proximity
+    btc_fib_pct = m["ta"]["btc"]["fib_pct_away"]
+    band_btc_fib = tri_flag(btc_fib_pct, warn=3.0, flag=1.5, higher_is_risk=False)[
+        1]  # closer (lower %) = worse
+    drivers.append(("BTC Fib 1.272", score_from_band(band_btc_fib, 0, 35, 70)))
+
+    alt_fib_pct = m["ta"]["alt"]["fib_pct_away"]
+    band_alt_fib = tri_flag(alt_fib_pct, warn=3.0,
+                            flag=1.5, higher_is_risk=False)[1]
+    drivers.append(("ALT Fib 1.272", score_from_band(band_alt_fib, 0, 35, 70)))
+
+    # Aggregate: cap total to 100 with a soft normalization
+    # Use top contributors naturally emerging; final we will display top 5
+    # Total score = mean of top N contributors (N=10) bounded 0..100
+    drivers_sorted = sorted(drivers, key=lambda x: x[1], reverse=True)
+    take = drivers_sorted[:10]
+    if not take:
+        total = 0
     else:
-        rel = "above" if trend == "above" else "below"
-        lines.append(
-            f"• Pi Cycle Top proximity: {icon} {prox:.2f}% {rel} (111D vs 2×350D)")
+        total = int(round(sum(s for _, s in take) / len(take)))
+    return min(100, max(0, total)), drivers_sorted
 
-    lines.append("")
 
-    # Momentum & Extensions
-    lines.append("Momentum (2W) & Extensions (1W)")
-    # BTC RSI
-    rb = m.get("rsi_btc_2w")
-    rb_ma = m.get("rsi_btc_2w_ma")
-    icon = green_yellow_red(rb, 60, 70)
-    rb_str = f"{rb:.1f}" if rb is not None else "n/a"
-    rbma_str = f"{rb_ma:.1f}" if rb_ma is not None else "n/a"
-    lines.append(
-        f"• BTC RSI (2W): {icon} {rb_str} (MA {rbma_str}) (warn ≥ 60.0, flag ≥ 70.0)")
-    # ETH/BTC RSI
-    re = m.get("rsi_ethbtc_2w")
-    re_ma = m.get("rsi_ethbtc_2w_ma")
-    icon = green_yellow_red(re, 55, 65)
-    re_str = f"{re:.1f}" if re is not None else "n/a"
-    rema_str = f"{re_ma:.1f}" if re_ma is not None else "n/a"
-    lines.append(
-        f"• ETH/BTC RSI (2W): {icon} {re_str} (MA {rema_str}) (warn ≥ 55.0, flag ≥ 65.0)")
-    # ALT RSI
-    ra = m.get("rsi_alt_2w")
-    ra_ma = m.get("rsi_alt_2w_ma")
-    icon = green_yellow_red(ra, 65, 75)
-    ra_str = f"{ra:.1f}" if ra is not None else "n/a"
-    rama_str = f"{ra_ma:.1f}" if ra_ma is not None else "n/a"
-    lines.append(
-        f"• ALT basket (equal-weight) RSI (2W): {icon} {ra_str} (MA {rama_str}) (warn ≥ 65.0, flag ≥ 75.0)")
-    # Stoch RSI BTC/ALT
-    kb, db = m.get("stoch_btc_2w_k"), m.get("stoch_btc_2w_d")
-    icon = "🔴" if (kb is not None and db is not None and (kb < db) and (kb >= 0.8 or db >= 0.8)) else (
-        "🟡" if (kb is not None and db is not None and (kb >= 0.8 or db >= 0.8)) else "🟢")
-    kb_s = f"{kb:.2f}" if kb is not None else "n/a"
-    db_s = f"{db:.2f}" if db is not None else "n/a"
-    lines.append(
-        f"• BTC Stoch RSI (2W) K/D: {icon} {kb_s}/{db_s} (overbought ≥ 0.80; red = bearish cross from OB)")
-    ka, da = m.get("stoch_alt_2w_k"), m.get("stoch_alt_2w_d")
-    icon = "🔴" if (ka is not None and da is not None and (ka < da) and (ka >= 0.8 or da >= 0.8)) else (
-        "🟡" if (ka is not None and da is not None and (ka >= 0.8 or da >= 0.8)) else "🟢")
-    ka_s = f"{ka:.2f}" if ka is not None else "n/a"
-    da_s = f"{da:.2f}" if da is not None else "n/a"
-    lines.append(
-        f"• ALT basket Stoch RSI (2W) K/D: {icon} {ka_s}/{da_s} (overbought ≥ 0.80; red = bearish cross from OB)")
-    # Fib prox
-    fb = m.get("fib_btc") or (None, None)
-    dist_b, lvl_b = fb
-    fa = m.get("fib_alt") or (None, None)
-    dist_a, lvl_a = fa
-    icon = green_yellow_red(
-        dist_b, 3.0, 1.5, reverse=True) if dist_b is not None else "🟡"
-    if dist_b is None or lvl_b is None:
-        lines.append("• BTC Fibonacci extension proximity: 🟡 n/a")
-    else:
-        lines.append(
-            f"• BTC Fibonacci extension proximity: {icon} 1.272 @ {dist_b:.2f}% away")
-    icon = green_yellow_red(
-        dist_a, 3.0, 1.5, reverse=True) if dist_a is not None else "🟡"
-    if dist_a is None or lvl_a is None:
-        lines.append("• ALT basket Fibonacci proximity: 🟡 n/a")
-    else:
-        lines.append(
-            f"• ALT basket Fibonacci proximity: {icon} 1.272 @ {dist_a:.2f}% away")
+def top5_lines(drivers_sorted: List[Tuple[str, int]]) -> List[str]:
+    lines = []
+    for name, sc in drivers_sorted[:5]:
+        band = "green" if sc < 40 else ("yellow" if sc < 70 else "red")
+        lines.append(f"• {name}: {color_dot(band)} {sc}/100")
+    return lines
 
-    lines.append("")
+
+def format_snapshot(m: Dict[str, Any]) -> str:
+    risk = m.get("risk", "moderate")
+    t = m.get("ta", {})
+    fng = m.get("fng", {})
+
+    # Market Structure
+    btc_dom = m.get("btc_dom")
+    eth_btc = m.get("eth_btc")
+    alt_ratio = m.get("altcap_btc_ratio")
+
+    b1, bb1 = tri_flag(btc_dom, 48.0, 60.0, True)
+    b2, bb2 = tri_flag(eth_btc, 0.072, 0.09, True)
+    b3, bb3 = tri_flag(alt_ratio, 1.44, 1.80, True)
+
+    # Derivatives
+    fund_max = m.get("funding_max_pct")
+    fund_med = m.get("funding_med_pct")
+    top3 = m.get("funding_top3", [])
+    b4, bb4 = tri_flag(fund_max, 0.08, 0.10, True)
+
+    oi_btc = m.get("oi_btc_usd")
+    oi_eth = m.get("oi_eth_usd")
+    b5, bb5 = tri_flag(oi_btc, 16e9, 20e9, True)
+    b6, bb6 = tri_flag(oi_eth, 6.4e9, 8e9, True)
+
+    # Sentiment
+    trends = m.get("trends_avg7")
+    b7, bb7 = tri_flag(trends, 60.0, 75.0, True)
+
+    fng_val = fng.get("value")
+    fng_ma14 = fng.get("ma14")
+    fng_ma30 = fng.get("ma30")
+    streak = fng.get("streak_greed_days")
+    pct30 = fng.get("pct30_greed")
+
+    b8, _ = tri_flag(fng_val, 56.0, 70.0, True)
+    b9, _ = tri_flag(fng_ma14, 56.0, 70.0, True)
+    b10, _ = tri_flag(fng_ma30, 52.0, 65.0, True)
+
+    # Pi cycle
+    pi = m.get("pi", {})
+    pi_prox = pi.get("prox_pct")
+    pi_crossed = pi.get("crossed")
+    days_cross = pi.get("days_since_cross")
+    bpi, _ = tri_flag(pi_prox, 90.0, 100.0, True)
+
+    # TA 2W + Fib
+    btc = t.get("btc", {})
+    ethbtc = t.get("ethbtc", {})
+    alt = t.get("alt", {})
+
+    btc_rsi = btc.get("rsi_2w")
+    btc_rsi_ma = btc.get("rsi_2w_ma")
+    eth_rsi = ethbtc.get("rsi_2w")
+    eth_rsi_ma = ethbtc.get("rsi_2w_ma")
+    alt_rsi = alt.get("rsi_2w")
+    alt_rsi_ma = alt.get("rsi_2w_ma")
+
+    btc_k = btc.get("k_2w")
+    btc_d = btc.get("d_2w")
+    alt_k = alt.get("k_2w")
+    alt_d = alt.get("d_2w")
+
+    btc_fib = btc.get("fib1272")
+    btc_fib_away = btc.get("fib_pct_away")
+    alt_fib = alt.get("fib1272")
+    alt_fib_away = alt.get("fib_pct_away")
 
     # Composite
-    score, top5, score_icon, subs = composite_certainty(m, profile=profile)
+    total, drivers_sorted = composite_score(m)
+    band_total = "green" if total < 40 else ("yellow" if total < 70 else "red")
+    comp_flag = color_dot(band_total)
+
+    # Build sections
+    lines = []
+    ts = m.get("ts", "")
+    lines.append(f"📊 Crypto Market Snapshot — {ts} UTC")
+    lines.append(f"Profile: {risk}")
+    lines.append("")
+    lines.append("Market Structure")
+    lines.append(
+        f"• Bitcoin market share of total crypto: {b1} {btc_dom:.2f}%  (warn ≥ 48.00%, flag ≥ 60.00%)" if btc_dom is not None else "• Bitcoin market share of total crypto: n/a")
+    lines.append(
+        f"• Ether price relative to Bitcoin (ETH/BTC): {b2} {eth_btc:.5f}  (warn ≥ 0.07200, flag ≥ 0.09000)" if eth_btc is not None else "• Ether price relative to Bitcoin (ETH/BTC): n/a")
+    lines.append(
+        f"• Altcoin market cap / Bitcoin market cap: {b3} {alt_ratio:.2f}  (warn ≥ 1.44, flag ≥ 1.80)" if alt_ratio is not None else "• Altcoin market cap / Bitcoin market cap: n/a")
+    lines.append("")
+    lines.append("Derivatives")
+    if fund_max is not None and fund_med is not None:
+        lines.append(
+            f"• Funding (basket: BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT, DOGEUSDT) — max: {b4} {fund_max:.3f}% | median: {color_dot(bb4)} {fund_med:.3f}%  (warn ≥ 0.080%, flag ≥ 0.100%)")
+    else:
+        lines.append("• Funding (basket): n/a")
+    if top3:
+        tops = ", ".join(
+            [f"{k.replace('-USDT-SWAP','USDT')} {v:.3f}%" for k, v in top3])
+        lines.append(f"  Top-3 funding extremes: {tops}")
+    lines.append(
+        f"• Bitcoin open interest (USD): {b5} {fmt_money(oi_btc)}  (warn ≥ $16,000,000,000, flag ≥ $20,000,000,000)")
+    lines.append(
+        f"• Ether open interest (USD): {b6} {fmt_money(oi_eth)}  (warn ≥ $6,400,000,000, flag ≥ $8,000,000,000)")
+    lines.append("")
+    lines.append("Sentiment")
+    lines.append(
+        f"• Google Trends avg (7d; crypto/bitcoin/ethereum): {b7} {trends:.1f}  (warn ≥ 60.0, flag ≥ 75.0)" if trends is not None else "• Google Trends avg: n/a")
+    if fng_val is not None:
+        lines.append(
+            f"• Fear & Greed Index (overall crypto): {b8} {int(fng_val)}  (warn ≥ 56, flag ≥ 70)")
+    if fng_ma14 is not None:
+        lines.append(
+            f"• Fear & Greed 14-day average: {b9} {fng_ma14:.1f}  (warn ≥ 56, flag ≥ 70)")
+    if fng_ma30 is not None:
+        lines.append(
+            f"• Fear & Greed 30-day average: {b10} {fng_ma30:.1f}  (warn ≥ 52, flag ≥ 65)")
+    if streak is not None and pct30 is not None:
+        lines.append(f"• Greed persistence: {('🔴' if streak>=10 or (pct30 is not None and pct30>=60) else ('🟡' if streak>=8 or (pct30 is not None and pct30>=48) else '🟢'))} {streak} days in a row | {pct30:.0f}% of last 30 days ≥ 70  (warn: days ≥ 8 or pct ≥ 48%; flag: days ≥ 10 or pct ≥ 60%)")
+    lines.append("")
+    lines.append("Cycle & On-Chain")
+    if pi_prox is not None:
+        suffix = " (crossed)" if pi_crossed else " of trigger (100% = cross)"
+        lines.append(f"• Pi Cycle Top proximity: {bpi} {pi_prox:.1f}%{suffix}")
+        if pi_crossed and days_cross is not None:
+            lines.append(f"  Days since cross: {days_cross}")
+    else:
+        lines.append("• Pi Cycle Top proximity: ⚪ n/a")
+    lines.append("")
+    lines.append("Momentum (2W) & Extensions (1W)")
+    if btc_rsi is not None and btc_rsi_ma is not None:
+        lines.append(
+            f"• BTC RSI (2W): {( '🔴' if btc_rsi>=70 else '🟡' if btc_rsi>=60 else '🟢')} {btc_rsi:.1f} (MA {btc_rsi_ma:.1f}) (warn ≥ 60.0, flag ≥ 70.0)")
+    if eth_rsi is not None and eth_rsi_ma is not None:
+        lines.append(
+            f"• ETH/BTC RSI (2W): {( '🔴' if eth_rsi>=65 else '🟡' if eth_rsi>=55 else '🟢')} {eth_rsi:.1f} (MA {eth_rsi_ma:.1f}) (warn ≥ 55.0, flag ≥ 65.0)")
+    if btc_k is not None and btc_d is not None:
+        lines.append(
+            f"• BTC Stoch RSI (2W) K/D: {( '🔴' if btc_k<btc_d and max(btc_k,btc_d)>=0.80 else '🟢')} {btc_k:.2f}/{btc_d:.2f} (overbought ≥ 0.80; red = bearish cross from OB)")
+    if btc_fib is not None and not math.isnan(btc_fib):
+        lines.append(f"• BTC Fibonacci extension proximity: {( '🔴' if (btc_fib_away is not None and btc_fib_away<=1.5) else '🟡' if (btc_fib_away is not None and btc_fib_away<=3.0) else '🟢')} 1.272 @ {btc_fib_away:.2f}% away (warn ≤ 3.0%, flag ≤ 1.5%)" if btc_fib_away is not None else "• BTC Fibonacci extension proximity: n/a")
+    if alt_rsi is not None and alt_rsi_ma is not None:
+        lines.append(
+            f"• ALT basket (equal-weight) RSI (2W): {( '🔴' if alt_rsi>=75 else '🟡' if alt_rsi>=65 else '🟢')} {alt_rsi:.1f} (MA {alt_rsi_ma:.1f}) (warn ≥ 65.0, flag ≥ 75.0)")
+    if alt_k is not None and alt_d is not None:
+        lines.append(
+            f"• ALT basket Stoch RSI (2W) K/D: {( '🔴' if alt_k<alt_d and max(alt_k,alt_d)>=0.80 else '🟢')} {alt_k:.2f}/{alt_d:.2f} (overbought ≥ 0.80; red = bearish cross from OB)")
+    if alt_fib is not None and not math.isnan(alt_fib):
+        lines.append(f"• ALT basket Fibonacci proximity: {( '🔴' if (alt_fib_away is not None and alt_fib_away<=1.5) else '🟡' if (alt_fib_away is not None and alt_fib_away<=3.0) else '🟢')} 1.272 @ {alt_fib_away:.2f}% away (warn ≤ 3.0%, flag ≤ 1.5%)" if alt_fib_away is not None else "• ALT basket Fibonacci proximity: n/a")
+
+    lines.append("")
     lines.append("Alt-Top Certainty (Composite)")
     lines.append(
-        f"• Certainty: {score_icon} {score}/100 (yellow ≥ 40, red ≥ 70)")
-    if top5:
-        lines.append("• Top drivers:")
-        for name, s, contrib in top5:
-            # label friendly names
-            label_map = {
-                "altcap_vs_btc": "Altcap/BTC",
-                "eth_btc": "ETH/BTC",
-                "funding": "Funding",
-                "OI_BTC": "BTC OI",
-                "OI_ETH": "ETH OI",
-                "trends": "Google Trends",
-                "fng_now": "F&G (today, scaled)",
-                "fng_ma14": "F&G 14-d",
-                "fng_ma30": "F&G 30-d",
-                "fng_persist": "F&G persistence",
-                "pi": "Pi Cycle",
-                "RSI_BTC_2W": "BTC RSI (2W)",
-                "RSI_ETHBTC_2W": "ETH/BTC RSI (2W)",
-                "Stoch_BTC_2W": "BTC Stoch RSI (2W)",
-                "RSI_ALT_2W": "ALT RSI (2W)",
-                "Stoch_ALT_2W": "ALT Stoch RSI (2W)",
-                "Fib_BTC": "BTC Fib 1.272",
-                "Fib_ALT": "ALT Fib 1.272",
-            }
-            label = label_map.get(name, name)
-            # color each driver by magnitude
-            d_icon = "🔴" if s >= 70 else ("🟡" if s >= 40 else "🟢")
-            lines.append(f"• {label}: {d_icon} {s}/100")
+        f"• Certainty: {comp_flag} {total}/100 (yellow ≥ 40, red ≥ 70)")
+    lines.append("• Top drivers:")
+    lines.extend(top5_lines(drivers_sorted))
 
-    # Flags
-    fl_score, fl_top5, fl_color, _ = composite_certainty(
-        m, profile=profile)  # recompute for flags list already within
-    flags = []
-    if (m.get("fng_now") or 0) >= 70:
-        flags.append("Greed is elevated (Fear & Greed Index)")
-    if (m.get("fng_ma30") or 0) >= 65:
-        flags.append("Fear & Greed 30-day avg in Greed")
-    if (m.get("fng_greed_run") or 0) >= 10 or (m.get("fng_greed_pct30") or 0) >= 60:
-        flags.append("Greed persistence is high")
-    if flags:
+    # Triggered flags summary (red only)
+    triggered: List[str] = []
+    if bb1 == "red":
+        triggered.append("BTC dominance elevated")
+    if bb2 == "red":
+        triggered.append("ETH/BTC elevated")
+    if bb3 == "red":
+        triggered.append("Alt market cap relative to BTC high")
+    if bb4 == "red":
+        triggered.append("Funding extreme")
+    if bb5 == "red":
+        triggered.append("BTC OI high")
+    if bb6 == "red":
+        triggered.append("ETH OI high")
+    if bb7 == "red":
+        triggered.append("Google Trends elevated")
+    if fng_ma30 is not None and fng_ma30 >= 65:
+        triggered.append("F&G 30-day avg in Greed")
+    if (streak is not None and streak >= 10) or (pct30 is not None and pct30 >= 60):
+        triggered.append("Greed persistence over threshold")
+    if pi_prox is not None and pi_prox >= 100.0:
+        triggered.append("Pi Cycle cross")
+
+    if triggered:
         lines.append("")
-        lines.append(f"⚠️ Triggered flags ({len(flags)}): " + ", ".join(flags))
+        lines.append(
+            f"⚠️ Triggered flags ({len(triggered)}): " + ", ".join(triggered))
 
     return "\n".join(lines)
 
-# ---------- Telegram Handlers ----------
+
+# ----------------------- Bot Handlers ----------------------
+USER_RISK: Dict[int, str] = {}  # per-user risk profile
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "Hi! I track cycle-top risk for alts using market structure, derivatives, sentiment, "
-        "Pi Cycle, and 2-week momentum.\n\n"
+    SUBSCRIBERS.add(update.effective_chat.id)
+    if update.effective_user:
+        USER_RISK[update.effective_user.id] = USER_RISK.get(
+            update.effective_user.id, DEFAULT_RISK)
+    msg = (
+        "Hi! I’ll track market-cycle metrics for you.\n\n"
         "Commands:\n"
-        "• /status – current assessment\n"
-        "You’ll also receive a daily summary automatically."
+        "• /status — current snapshot\n"
+        "• /setrisk <conservative|moderate|aggressive> — tune thresholds\n\n"
+        f"Daily summary at {PUSH_HOUR_UTC:02d}:00 UTC and alerts every {ALERT_MINUTES} min."
     )
-    await update.message.reply_text(txt)
+    await update.message.reply_text(msg)
+
+
+async def cmd_setrisk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /setrisk <conservative|moderate|aggressive>")
+        return
+    val = context.args[0].strip().lower()
+    if val not in RISK_MULT:
+        await update.message.reply_text("Pick one of: conservative, moderate, aggressive")
+        return
+    USER_RISK[update.effective_user.id] = val
+    await update.message.reply_text(f"Okay — risk profile set to '{val}'.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        async with DataClient() as_dummy:  # type: ignore
-            pass
-    except Exception:
-        pass
-    dc = DataClient()
-    try:
-        m = await gather_metrics(dc)
-        text = format_snapshot(m)
-        await update.message.reply_text(text)
-    except Exception as e:
-        log.exception("status failed")
-        await update.message.reply_text(f"⚠️ Could not fetch metrics right now: {e}")
-    finally:
-        await dc.close()
+    # per-user risk or default
+    risk = USER_RISK.get(update.effective_user.id,
+                         DEFAULT_RISK) if update.effective_user else DEFAULT_RISK
+    async with DataClient() as dc:
+        try:
+            m = await gather_metrics(dc, risk)
+            text = format_snapshot(m)
+            await update.message.reply_text(text)
+        except Exception as e:
+            log.exception("status failed")
+            await update.message.reply_text(f"⚠️ Could not fetch metrics right now: {e}")
 
-# ---------- Push jobs ----------
+# -------------------- Pushers / Schedulers -----------------
 
 
 async def push_summary(app: Application):
-    chat_id = CFG["telegram"].get("admin_chat_id") or ""
-    if not chat_id:
-        return
-    dc = DataClient()
-    try:
-        m = await gather_metrics(dc)
-        text = format_snapshot(m)
-        await app.bot.send_message(chat_id=chat_id, text=text)
-    except Exception as e:
-        log.exception("push_summary failed: %s", e)
-    finally:
-        await dc.close()
+    # push to all subscribers once per day
+    async with DataClient() as dc:
+        for chat_id in list(SUBSCRIBERS):
+            try:
+                risk = DEFAULT_RISK
+                m = await gather_metrics(dc, risk)
+                txt = format_snapshot(m)
+                await app.bot.send_message(chat_id=chat_id, text=txt)
+            except Exception as e:
+                log.warning("push_summary to %s failed: %s", chat_id, e)
 
 
 async def push_alerts(app: Application):
-    # Keep it simple: reuse same snapshot for now (you can tighten thresholds here)
-    await push_summary(app)
+    # simple alert: send only if any red flags triggered
+    async with DataClient() as dc:
+        try:
+            m = await gather_metrics(dc, DEFAULT_RISK)
+            txt = format_snapshot(m)
+            # detect "Triggered flags (" section
+            if "⚠️ Triggered flags (" in txt:
+                for chat_id in list(SUBSCRIBERS):
+                    await app.bot.send_message(chat_id=chat_id, text="⏰ Alert check\n\n" + txt)
+        except Exception as e:
+            log.warning("push_alerts failed: %s", e)
 
-# ---------- Health server ----------
+# --------------------------- Health ------------------------
 
 
-async def handle_root(request):
-    return web.Response(text="Crypto Cycle Bot is running.")
+async def health(request):
+    return web.json_response({"ok": True, "ts": datetime.now(timezone.utc).isoformat()})
 
-
-async def handle_health(request):
-    return web.json_response({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
-
-
-async def start_health_server():
-    app = web.Application()
-    app.router.add_get("/", handle_root)
-    app.router.add_get("/health", handle_health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
-    await site.start()
-    log.info("Health server listening on :8080")
-
-# ---------- Main ----------
+# --------------------------- Main --------------------------
 
 
 async def main():
-    token = CFG["telegram"]["token"]
-    if not token:
-        raise RuntimeError("TELEGRAM_TOKEN not set")
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN env var required")
 
-    await start_health_server()
+    # Telegram app
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("setrisk", cmd_setrisk))
 
-    # Schedulers
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    # daily summary at HH:MM
-    hh, mm = CFG.get("daily_push_utc_hhmm", "14:00").split(":")
-    scheduler.add_job(lambda: asyncio.create_task(push_summary(
-        app)), "cron", hour=int(hh), minute=int(mm), id="push_summary")
-    # intraday alerts
-    every = int(CFG.get("alerts_every_minutes", 15))
-    scheduler.add_job(lambda: asyncio.create_task(push_alerts(
-        app)), "cron", minute=f"*/{every}", id="push_alerts")
+    # Health server (Koyeb probes)
+    runner = web.AppRunner(web.Application())
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=8080)
+    runner._app.router.add_get("/health", health)
+    await site.start()
+    log.info("Health server listening on :8080")
+
+    # Scheduler
+    scheduler = AsyncIOScheduler(timezone=str(get_localzone()))
+    # daily summary
+    scheduler.add_job(lambda: asyncio.create_task(push_summary(app)),
+                      "cron", hour=PUSH_HOUR_UTC, minute=0, second=0, id="push_summary", coalesce=True, max_instances=1)
+    # alerts
+    scheduler.add_job(lambda: asyncio.create_task(push_alerts(app)),
+                      "cron", minute=f"*/{ALERT_MINUTES}", id="push_alerts", coalesce=True, max_instances=1)
     scheduler.start()
-    log.info("Bot running. Press Ctrl+C to exit.")
 
-    await app.delete_webhook(drop_pending_updates=True)
+    log.info("Bot running. Press Ctrl+C to exit.")
     await app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
