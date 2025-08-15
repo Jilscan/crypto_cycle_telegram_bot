@@ -1,8 +1,7 @@
 # main.py
 # Crypto Cycle Telegram Bot — single-file version with Top-5 contributors
-# (Fixed f-string formatting in market-structure lines)
+# (Fixed nested f-string in Fear & Greed lines + earlier market-structure fixes)
 
-from telegram.ext import Application
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update
 import os
@@ -645,6 +644,14 @@ def fmt_metrics(m: Dict[str, Any]) -> str:
     trends_val = m.get("trends7")
     trends_str = "n/a" if trends_val is None else f"{trends_val:.1f}"
 
+    fng = m.get("fng") or {}
+    fng_today = fng.get("today")
+    fng_today_str = "n/a" if fng_today is None else str(int(fng_today))
+    ma14_val = fng.get("ma14")
+    ma30_val = fng.get("ma30")
+    fng_ma14_str = "n/a" if ma14_val is None else f"{ma14_val:.1f}"
+    fng_ma30_str = "n/a" if ma30_val is None else f"{ma30_val:.1f}"
+
     # Market structure badges
     b_btc_dom = badge(
         m.get("btc_dom"), thr["btc_dominance_warn"], thr["btc_dominance_flag"], True)
@@ -666,7 +673,6 @@ def fmt_metrics(m: Dict[str, Any]) -> str:
     # Sentiment
     b_tr = badge(m.get("trends7"),
                  thr["google_trends_7d_warn"], thr["google_trends_7d_flag"], True)
-    fng = m.get("fng") or {}
     b_fng = badge(fng.get("today"),
                   thr["fear_greed_warn"], thr["fear_greed_flag"], True)
     b_fng14 = badge(
@@ -791,9 +797,11 @@ def fmt_metrics(m: Dict[str, Any]) -> str:
     lines.append(
         f"• Google Trends avg (7d; crypto/bitcoin/ethereum): {b_tr}{trends_str}  (warn ≥ {BASE_THRESHOLDS['google_trends_7d_warn']:.1f}, flag ≥ {BASE_THRESHOLDS['google_trends_7d_flag']:.1f})")
     lines.append(
-        f"• Fear & Greed Index (overall crypto): {b_fng}{int(fng.get('today')) if fng.get('today') is not None else 'n/a'} (Greed)  (warn ≥ {BASE_THRESHOLDS['fear_greed_warn']}, flag ≥ {BASE_THRESHOLDS['fear_greed_flag']})")
-    lines.append(f"• Fear & Greed 14-day average: {b_fng14}{f'{fng.get('ma14'):.1f}' if fng.get('ma14') is not None else 'n/a'}  (warn ≥ {BASE_THRESHOLDS['fear_greed_ma14_warn']}, flag ≥ {BASE_THRESHOLDS['fear_greed_ma14_flag']})")
-    lines.append(f"• Fear & Greed 30-day average: {b_fng30}{f'{fng.get('ma30'):.1f}' if fng.get('ma30') is not None else 'n/a'}  (warn ≥ {BASE_THRESHOLDS['fear_greed_ma30_warn']}, flag ≥ {BASE_THRESHOLDS['fear_greed_ma30_flag']})")
+        f"• Fear & Greed Index (overall crypto): {b_fng}{fng_today_str} (Greed)  (warn ≥ {BASE_THRESHOLDS['fear_greed_warn']}, flag ≥ {BASE_THRESHOLDS['fear_greed_flag']})")
+    lines.append(
+        f"• Fear & Greed 14-day average: {b_fng14}{fng_ma14_str}  (warn ≥ {BASE_THRESHOLDS['fear_greed_ma14_warn']}, flag ≥ {BASE_THRESHOLDS['fear_greed_ma14_flag']})")
+    lines.append(
+        f"• Fear & Greed 30-day average: {b_fng30}{fng_ma30_str}  (warn ≥ {BASE_THRESHOLDS['fear_greed_ma30_warn']}, flag ≥ {BASE_THRESHOLDS['fear_greed_ma30_flag']})")
     lines.append(
         f"• Greed persistence: {tri_color(subs.get('F&GPersist', 0), 33, 66)}{gp_desc}  (warn: days ≥ {BASE_THRESHOLDS['greed_days_row_warn']} or pct ≥ {int(BASE_THRESHOLDS['greed_pct30_warn']*100)}%; flag: days ≥ {BASE_THRESHOLDS['greed_days_row_flag']} or pct ≥ {int(BASE_THRESHOLDS['greed_pct30_flag']*100)}%)")
 
@@ -818,7 +826,10 @@ def fmt_metrics(m: Dict[str, Any]) -> str:
     else:
         lines.append(f"• ALT basket Fibonacci proximity: {b_fib_alt}n/a")
 
+    comp, subs2 = composite_score(m)
+    comp_badge = tri_color(comp)
     comp_text = f"• Certainty: {comp_badge}{comp}/100 (yellow ≥ 40, red ≥ 70)"
+
     lines.append("\n<b>Alt-Top Certainty (Composite)</b>")
     lines.append(comp_text)
     if top5_lines:
